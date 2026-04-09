@@ -1,0 +1,3 @@
+python-telegram-bot[job-queue]
+flask
+psycopg2-binary
