@@ -1558,7 +1558,7 @@ def main():
             MessageHandler(filters.Regex("^❓ အသုံးပြုနည်း$"), handle_help),
             MessageHandler(filters.Regex("^📤 Share မည်$"), share_logic),
             CommandHandler("cancel", cancel_tarot),
-            MessageHandler(filters.Regex("^✍️ အကြံပြုမည်$"), handle_suggestion)
+            MessageHandler(filters.Regex("^✍️ အကြံပြုမည်$"), handle_suggestion),
             CommandHandler("start", start)
         ],
         allow_reentry=True
