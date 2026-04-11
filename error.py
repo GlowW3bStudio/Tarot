@@ -346,7 +346,7 @@ async def tarot_init(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # ၂။ မွေးနေ့ရှိသည်ဖြစ်စေ၊ မရှိသည်ဖြစ်စေ အမြဲတမ်းပြန်တောင်းမည်
         # 🌟 Cancel Button ထည့်သွင်းထားပါသည် 🌟
-        cancel_markup = InlineKeyboardMarkup([[InlineKeyboardButton("❌ မမေးတော့ပါ", callback_data="cancel_tarot")]])
+    cancel_markup = InlineKeyboardMarkup([[InlineKeyboardButton("❌ မမေးတော့ပါ", callback_data="cancel_tarot")]])
     await update.message.reply_text(
             "🔮 ဟောစာတမ်း တွက်ချက်ပေးဖို့အတွက် လူကြီးမင်းရဲ့ မွေးသက္ကရာဇ်လေး သိပါရစေရှင်။ \n"
             "ကျေးဇူးပြုပြီး *(နေ့/လ/ခုနှစ်)* ပုံစံလေးအတိုင်း မှန်ကန်အောင် ရိုက်ပို့ပေးပါဦးနော်။\n"
