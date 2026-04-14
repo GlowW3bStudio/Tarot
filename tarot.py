@@ -1564,7 +1564,7 @@ def main():
     )
 
     love_conv_handler = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^❤️ ချစ်သူနဲ့ကိုက်ညီမှု(RS)$"), love_start)],
+        entry_points=[MessageHandler(filters.Regex("^❤️ ချစ်သူနဲ့ကိုက်ညီမှု\(RS)\$"), love_start)],
         states={
             CHOOSE_LOVE_METHOD: [CallbackQueryHandler(love_method_choice)],
             TAROT_LOVE_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, tarot_love_input),
