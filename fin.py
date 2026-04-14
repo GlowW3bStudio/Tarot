@@ -1889,7 +1889,7 @@ def main():
     # ကျန်တဲ့ Button များ
     app.add_handler(MessageHandler(filters.Regex("^🔮 Tarot မေးမည်$"), tarot_init))
     app.add_handler(MessageHandler(filters.Regex("^♈ ရာသီခွင်ပင်ကိုယ်စရိုက်$"), zodiac_personality_start))
-    app.add_handler(MessageHandler(filters.Regex("^❤️ ချစ်သူနဲ့ကိုက်ညီမှု\(RS\)$"), love_start))
+    app.add_handler(MessageHandler(filters.Regex(r"^❤️ ချစ်သူနဲ့ကိုက်ညီမှု\(RS\)$"), love_start))
     app.add_handler(MessageHandler(filters.Regex("^🎂 မွေးနေ့မှတ်မည်$"), manage_bday))
     app.add_handler(MessageHandler(filters.Regex("^✍️ အကြံပြုစာပို့ရန်$"), handle_suggestion))
     app.add_handler(MessageHandler(filters.Regex("^📤 Share မည်$"), share_logic))
