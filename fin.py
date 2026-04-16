@@ -1471,7 +1471,7 @@ async def send_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_photo(
                 chat_id=target_id, 
                 photo=photo_file_id, 
-                caption=message_to_send
+                caption=message_to_send,
                 reply_markup=main_kb 
             )
         else:
