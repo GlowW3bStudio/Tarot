@@ -78,7 +78,7 @@ class DatabaseManager:
     def connect(self):
         try:
             # URI Link ကို အသုံးပြု၍ ချိတ်ဆက်ခြင်း
-            self.pool = psycopg2.pool.SimpleConnectionPool(1, 15, dsn=DATABASE_URL, sslmode='require')
+            self.pool = psycopg2.pool.SimpleConnectionPool(1, 50, dsn=DATABASE_URL, sslmode='require')
             logger.info("✅ PostgreSQL Connection Pool Established.")
         except Exception as e:
             logger.critical(f"❌ DB Connection Error: {e}")
@@ -131,43 +131,22 @@ def load_guide_assets():
 
 GUIDE_DATA = load_guide_assets()
 
-def load_zodiac_pers_assets():
-    if os.path.exists('zodiac_personality.json'):
-        with open('zodiac_personality.json', 'r', encoding='utf-8') as f:
-            return json.load(f)
-    return {}
-
-ZODIAC_PERS_DATA = load_zodiac_pers_assets()
-
-
-# --- Love Calculator Setup ပြင်ဆင်ချက် ---
+# --- Love Calculator Setup ---
 def load_love_data():
-    tarot_near = []
-    tarot_ldr = []
-    zodiac_near = {}
-    zodiac_ldr = {}
+    tarot_love_data = []
+    zodiac_love_data = {}
     try:
-        # Tarot Files
-        if os.path.exists('tarot_love_near.json'):
-            with open('tarot_love_near.json', 'r', encoding='utf-8') as f:
-                tarot_near = json.load(f)
-        if os.path.exists('tarot_love_ldr.json'):
-            with open('tarot_love_ldr.json', 'r', encoding='utf-8') as f:
-                tarot_ldr = json.load(f)
-        
-        # Zodiac Files
-        if os.path.exists('zodiac_love_near.json'):
-            with open('zodiac_love_near.json', 'r', encoding='utf-8') as f:
-                zodiac_near = json.load(f)
-        if os.path.exists('zodiac_love_ldr.json'): # space ပါသော နာမည်အတိုင်း
-            with open('zodiac_love_ldr.json', 'r', encoding='utf-8') as f:
-                zodiac_ldr = json.load(f)
+        if os.path.exists('tarot_love.json'):
+            with open('tarot_love.json', 'r', encoding='utf-8') as f:
+                tarot_love_data = json.load(f)
+        if os.path.exists('zodiac_love.json'):
+            with open('zodiac_love.json', 'r', encoding='utf-8') as f:
+                zodiac_love_data = json.load(f)
     except Exception as e:
-        logger.error(f"Error loading love JSON files: {e}")
-    return tarot_near, tarot_ldr, zodiac_near, zodiac_ldr
+        logger.error(f"Error loading love JSON: {e}")
+    return tarot_love_data, zodiac_love_data
 
-# Variable ၄ ခုနဲ့ ခွဲသိမ်းလိုက်ပါပြီ
-TAROT_NEAR, TAROT_LDR, ZODIAC_NEAR, ZODIAC_LDR = load_love_data()
+TAROT_LOVE_DATA, ZODIAC_LOVE_DATA = load_love_data()
 
 ZODIAC_SIGNS = [
     "Aries", "Taurus", "Gemini", 
@@ -176,15 +155,15 @@ ZODIAC_SIGNS = [
     "Capricorn", "Aquarius", "Pisces"
 ]
 
-def get_zodiac_keyboard(step="first"):
+def get_zodiac_keyboard(step="male"):
     keyboard = []
     for i in range(0, 12, 3):
         row = [InlineKeyboardButton(ZODIAC_SIGNS[i], callback_data=f"zlove_{ZODIAC_SIGNS[i]}"),
                InlineKeyboardButton(ZODIAC_SIGNS[i+1], callback_data=f"zlove_{ZODIAC_SIGNS[i+1]}"),
                InlineKeyboardButton(ZODIAC_SIGNS[i+2], callback_data=f"zlove_{ZODIAC_SIGNS[i+2]}")]
         keyboard.append(row)
-    if step == "second":
-        keyboard.append([InlineKeyboardButton("🔙 ရာသီခွင် ပြန်ရွေးမည်", callback_data="zlove_back_first")])
+    if step == "female":
+        keyboard.append([InlineKeyboardButton("🔙 ယောကျ်ားလေး ရာသီခွင် ပြန်ရွေးမည်", callback_data="zlove_back_male")])
     keyboard.append([InlineKeyboardButton("❌ မမေးတော့ပါ", callback_data="love_cancel")])
     return InlineKeyboardMarkup(keyboard)
 
@@ -247,10 +226,6 @@ main_kb = ReplyKeyboardMarkup([
     [KeyboardButton("✍️ အကြံပြုစာပို့ရန်"), KeyboardButton("📤 Share မည်")]
 ], resize_keyboard=True, is_persistent=True)
 
-cancel_review_kb = ReplyKeyboardMarkup([
-    [KeyboardButton("🚫 မပေးတော့ပါ")]
-], resize_keyboard=True, is_persistent=True)
-
 async def send_typing(update, context):
     """စာပြန်ခါနီးတိုင်း 'is typing...' ပေါ်စေရန်"""
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action='typing')
@@ -274,8 +249,7 @@ def init_db():
                 ("bday_status", "BOOLEAN DEFAULT TRUE"),
                 ("last_active", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"),
                 ("join_date", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"),
-                ("is_banned", "BOOLEAN DEFAULT FALSE"),
-                ("is_active", "BOOLEAN DEFAULT TRUE")
+                ("is_banned", "BOOLEAN DEFAULT FALSE")
             ]
             
             for col_name, col_type in columns:
@@ -305,36 +279,28 @@ def init_db():
 WAIT_BDAY, WAIT_CAT, WAIT_SUB, WAIT_NUMS, WAIT_FEEDBACK, WAIT_REVIEW_TEXT, WAIT_SUGGESTION_TEXT, WAIT_PERMANENT_BDAY, WAIT_ZODIAC_PERS, WAIT_GENDER_PERS, SELECT_GUIDE_TYPE, GET_GUIDE_NUM, SELECT_OUTCOME_SUB = range(13)
 
 # --- States for Love Calculator ---
-(SELECT_RELATION_TYPE, CHOOSE_LOVE_METHOD, TAROT_LOVE_INPUT, 
- ZODIAC_FIRST, ZODIAC_SECOND, ZODIAC_CONFIRM) = range(20, 26)
+(CHOOSE_LOVE_METHOD, TAROT_LOVE_INPUT, 
+ ZODIAC_MALE, ZODIAC_FEMALE, ZODIAC_CONFIRM) = range(20, 25)
 
 async def check_ban_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """User နှိပ်လိုက်တိုင်း Ban ခံထားရခြင်း ရှိမရှိ စစ်ဆေးမည် (Cache စနစ်ဖြင့်)"""
+    """User နှိပ်လိုက်တိုင်း Ban ခံထားရခြင်း ရှိမရှိ စစ်ဆေးမည် (True=Banned, False=Normal)"""
     user_id = update.effective_user.id
     # Admin ကို ဘယ်တော့မှ မပိတ်ပါ
     if user_id == ADMIN_ID:
         return False
         
-    # 💡 ၁။ Cache ထဲမှာ စစ်ထားပြီးသား ရှိမရှိ အရင်ကြည့်မည်
-    if 'is_banned' in context.user_data:
-        is_banned = context.user_data['is_banned']
-    else:
-        # 💡 ၂။ Cache ထဲမှာ မရှိမှသာ Database ကို သွားစစ်မည်
-        conn = db_mgr.get_conn()
-        is_banned = False
-        try:
-            with conn.cursor() as c:
-                c.execute("SELECT is_banned FROM users WHERE user_id = %s", (user_id,))
-                res = c.fetchone()
-                if res and res[0] is True:
-                    is_banned = True
-        except Exception as e:
-            logger.error(f"Ban Check Error: {e}")
-        finally:
-            db_mgr.put_conn(conn)
-            
-        # 💡 ၃။ ရလာတဲ့ရလဒ်ကို နောက်တစ်ခါ ထပ်မစစ်ရအောင် Cache ထဲ မှတ်ထားလိုက်မည်
-        context.user_data['is_banned'] = is_banned
+    conn = db_mgr.get_conn()
+    is_banned = False
+    try:
+        with conn.cursor() as c:
+            c.execute("SELECT is_banned FROM users WHERE user_id = %s", (user_id,))
+            res = c.fetchone()
+            if res and res[0] is True:
+                is_banned = True
+    except Exception as e:
+        logger.error(f"Ban Check Error: {e}")
+    finally:
+        db_mgr.put_conn(conn)
         
     if is_banned:
         # Ban ခံရသူဆိုလျှင် ဤစာသာ ပြမည်
@@ -361,58 +327,47 @@ async def cancel_tarot(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #Creditစစ်တဲ့အပိုင်း
 async def check_user_credits(user_id):
     if user_id == ADMIN_ID: return True
-    
-    # 💡 Database အလုပ်ကို Background Thread သို့ လွှဲပြောင်းပေးမည့် Local Function
-    def _db_task():
-        conn = db_mgr.get_conn()
-        try:
-            with conn.cursor() as c:
-                # ၁။ အရင်ဆုံး User ရှိမရှိ စစ်မယ်၊ မရှိရင် အသစ်ထည့်ပြီး Credit 7, 3 တန်းပေးမယ်
-                c.execute("""
-                    INSERT INTO users (user_id, gift_credits, daily_credits) 
-                    VALUES (%s, %s, %s) 
-                    ON CONFLICT (user_id) DO NOTHING
-                """, (user_id, GIFT_CREDITS_LIMIT, DAILY_CREDITS_LIMIT))
-                conn.commit()
+        
+    conn = db_mgr.get_conn()
+    try:
+        with conn.cursor() as c:
+            # ၁။ အရင်ဆုံး User ရှိမရှိ စစ်မယ်၊ မရှိရင် အသစ်ထည့်ပြီး Credit 7, 3 တန်းပေးမယ်
+            c.execute("""
+                INSERT INTO users (user_id, gift_credits, daily_credits) 
+                VALUES (%s, %s, %s) 
+                ON CONFLICT (user_id) DO NOTHING
+            """, (user_id, GIFT_CREDITS_LIMIT, DAILY_CREDITS_LIMIT))
+            conn.commit()
 
-                # ၂။ ပြီးမှ Credit ကို ပြန်စစ်မယ်
-                c.execute("SELECT gift_credits, daily_credits FROM users WHERE user_id = %s", (user_id,))
-                res = c.fetchone()
-                if res and (res[0] > 0 or res[1] > 0):
-                    return True
-        except Exception as e:
-            logger.error(f"Credit Check Error: {e}")
-        finally:
-            db_mgr.put_conn(conn)
-        return False
-
-    # 💡 Asyncio ကို သုံးပြီး Main Bot မရပ်သွားအောင် Thread ခွဲ၍ Run မည်[span_4](start_span)[span_4](end_span)
-    return await asyncio.to_thread(_db_task)
+            # ၂။ ပြီးမှ Credit ကို ပြန်စစ်မယ်
+            c.execute("SELECT gift_credits, daily_credits FROM users WHERE user_id = %s", (user_id,))
+            res = c.fetchone()
+            if res and (res[0] > 0 or res[1] > 0):
+                return True
+    except Exception as e:
+        logger.error(f"Credit Check Error: {e}")
+    finally:
+        db_mgr.put_conn(conn)
+    return False
 
 async def deduct_credit(user_id):
     if user_id == ADMIN_ID: return
-    
-    # 💡 Credit နှုတ်သည့် အလုပ်ကိုလည်း Thread ဖြင့် ခွဲထုတ်မည်
-    def _db_task():
-        conn = db_mgr.get_conn()
-        try:
-            with conn.cursor() as c:
-                c.execute("SELECT gift_credits, daily_credits FROM users WHERE user_id = %s", (user_id,))
-                res = c.fetchone()
-                if res:
-                    gift, daily = res[0], res[1]
-                    if gift > 0:
-                        c.execute("UPDATE users SET gift_credits = gift_credits - 1 WHERE user_id = %s", (user_id,))
-                    elif daily > 0:
-                        c.execute("UPDATE users SET daily_credits = daily_credits - 1 WHERE user_id = %s", (user_id,))
-            conn.commit()
-        except Exception as e:
-            logger.error(f"Credit Deduction Error: {e}")
-        finally:
-            db_mgr.put_conn(conn)
-
-    # 💡 Thread ခွဲ၍ အလုပ်လုပ်စေမည်[span_6](start_span)[span_6](end_span)
-    await asyncio.to_thread(_db_task)
+    conn = db_mgr.get_conn()
+    try:
+        with conn.cursor() as c:
+            c.execute("SELECT gift_credits, daily_credits FROM users WHERE user_id = %s", (user_id,))
+            res = c.fetchone()
+            if res:
+                gift, daily = res[0], res[1]
+                if gift > 0:
+                    c.execute("UPDATE users SET gift_credits = gift_credits - 1 WHERE user_id = %s", (user_id,))
+                elif daily > 0:
+                    c.execute("UPDATE users SET daily_credits = daily_credits - 1 WHERE user_id = %s", (user_id,))
+        conn.commit()
+    except Exception as e:
+        logger.error(f"Credit Deduction Error: {e}")
+    finally:
+        db_mgr.put_conn(conn)
 
 async def manage_bday(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """မွေးနေ့ မှတ်သား/ဖျက်သိမ်းရန် ခလုတ်ပြသခြင်း"""
@@ -489,15 +444,17 @@ async def handle_gender_personality(update: Update, context: ContextTypes.DEFAUL
     # ဟောစာတမ်း မပြမီ Credit ၁ ခု နှုတ်မည်
     await deduct_credit(user_id)
 
-    # ❌ (မူလက ဒီနေရာမှာရှိတဲ့ with open(...) ဆိုတဲ့ File ဖတ်တဲ့ကုဒ်တွေကို ဖြုတ်လိုက်ပါပြီ) ❌
-
-    # ✅ Global variable ကနေ တိုက်ရိုက် ယူသုံးပါမည် ✅
-    if not ZODIAC_PERS_DATA:
+    
+    # zodiac_personality.json ဖိုင်မှ data ကို ဖတ်ခြင်း
+    if os.path.exists('zodiac_personality.json'):
+        with open('zodiac_personality.json', 'r', encoding='utf-8') as f:
+            all_data = json.load(f)
+    else:
         await query.edit_message_text("❌ ဟောစာတမ်းဖိုင်ကို ရှာမတွေ့ပါသဖြင့် ခဏစောင့်ပေးပါရှင်။")
         return ConversationHandler.END
 
     # JSON Key များနှင့် တိုက်စစ်၍ Data ဆွဲထုတ်ခြင်း
-    z_info = ZODIAC_PERS_DATA.get(zodiac, {}).get(gender, {})
+    z_info = all_data.get(zodiac, {}).get(gender, {})
     
     if not z_info:
         await query.edit_message_text("❌ စာသားများ ပြင်ဆင်နေဆဲ ဖြစ်ပါသည်ရှင်။")
@@ -728,29 +685,14 @@ async def process_guide_result(update: Update, context: ContextTypes.DEFAULT_TYP
         result_msg = card_info.get("outcomes", {}).get(sub_mode, "ရလဒ်စာသား ပြင်ဆင်နေဆဲဖြစ်ပါတယ်ရှင်။")
         header = "🎯 **ရလဒ်**"
 
-    if os.path.exists(img_path) or selected_card_id in card_file_cache:
+    if os.path.exists(img_path):
         caption = f"✨ {update.effective_user.full_name} ရွေးချယ်လိုက်သောကဒ် - **{card_name}**"
-        
-        # 💡 Cache ထဲမှာရှိရင် file_id ကိုသုံးမယ်၊ မရှိရင် file ဖွင့်မယ်
-        if selected_card_id in card_file_cache:
-            sent_msg = await update.message.reply_photo(
-                photo=card_file_cache[selected_card_id],
-                caption=caption,
-                parse_mode="Markdown",
-                write_timeout=60
-            )
-        else:
-            with open(img_path, 'rb') as photo:
-                sent_msg = await update.message.reply_photo(
-                    photo=photo,
-                    caption=caption,
-                    parse_mode="Markdown",
-                    write_timeout=60
-                )
-        
-        # 💡 အသစ်တင်လိုက်ရတာဆိုရင် နောက်လူတွေအတွက် file_id ကို Cache ထဲ မှတ်ထားလိုက်မယ်
-        if selected_card_id not in card_file_cache:
-            card_file_cache[selected_card_id] = sent_msg.photo[-1].file_id
+        await update.message.reply_photo(
+            photo=open(img_path, 'rb'), 
+            caption=caption, 
+            parse_mode="Markdown",
+            write_timeout=60 # Time-out error မဖြစ်အောင် ထည့်သွင်းထားပါသည်
+        )
     
     await asyncio.sleep(1)
     await send_typing(update, context)
@@ -829,52 +771,28 @@ async def tarot_init(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown", reply_markup=cancel_markup
     )
     return WAIT_BDAY
-
-
-
-async def love_cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text("ဟုတ်ကဲ့ပါရှင်။ မေးမြန်းမှုကို ရပ်နားလိုက်ပါပြီ။ သာယာပျော်ရွှင်တဲ့ နေ့လေးတစ်နေ့ ဖြစ်ပါစေရှင်။ ✨")
-    return ConversationHandler.END
-
-# --- ၁။ အချစ်ရေး စတင်ခြင်း (Near/LDR ရွေးခိုင်းခြင်း) ---
+        
+        
 async def love_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """❤️ ချစ်သူနဲ့ကိုက်ညီမှု(RS) ခလုတ် နှိပ်လျှင် စတင်မည့်နေရာ"""
+    # Ban ခံထားရသူဆိုလျှင် ဝင်ခွင့်မပေးပါ
     if await check_ban_status(update, context): return ConversationHandler.END
-    
-    keyboard = [
-        [InlineKeyboardButton("👫 အနေနီးအချစ်", callback_data="rel_near"),
-         InlineKeyboardButton("🌍 LDRs", callback_data="rel_ldr")],
-        [InlineKeyboardButton("❌ မမေးတော့ပါ", callback_data="love_cancel")]
-    ]
-    text = "ပိုမိုမှန်ကန်တဲ့ လမ်းညွှန်ချက်လေးတွေ ပေးနိုင်ဖို့ လူကြီးမင်းတို့ရဲ့ အချစ်ရေးပုံစံလေးကို ရွေးချယ်ပေးပါဦးရှင်။ ✨"
-    
-    if update.message:
-        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-    else:
-        await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-    return SELECT_RELATION_TYPE
-
-# --- ၂။ Relation Type ကို မှတ်သားခြင်း ---
-async def handle_relation_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    relation = "near" if query.data == "rel_near" else "ldr"
-    context.user_data['relation_type'] = relation
     
     keyboard = [
         [InlineKeyboardButton("🃏 Tarot ကဒ်ဖြင့်", callback_data="love_method_tarot"),
          InlineKeyboardButton("♈ ရာသီခွင်ဖြင့်", callback_data="love_method_zodiac")],
         [InlineKeyboardButton("❌ မမေးတော့ပါ", callback_data="love_cancel")]
     ]
-    await query.edit_message_text(
-        "လူကြီးမင်းတို့နှစ်ဦးရဲ့ အချစ်ရေးကံကြမ္မာကို ဘယ်နည်းလမ်းနဲ့ စစ်ဆေးချင်ပါသလဲရှင်။ ✨",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    text = "လူကြီးမင်းတို့ရဲ့ အချစ်ရေးကံကြမ္မာကို ဘယ်နည်းလမ်းနဲ့ တွက်ချက်စစ်ဆေးချင်ပါသလဲရှင်။ နှစ်သက်ရာ နည်းလမ်းတစ်ခုကို အောက်မှာ ရွေးချယ်ပေးပါရှင်。"
+    
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text(text, reply_markup=reply_markup)
+    else:
+        await update.message.reply_text(text, reply_markup=reply_markup)
     return CHOOSE_LOVE_METHOD
 
-# --- ၃။ Method ရွေးချယ်ခြင်း ---
 async def love_method_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -882,51 +800,123 @@ async def love_method_choice(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if query.data == "love_cancel":
         await query.edit_message_text("ဟုတ်ကဲ့ပါရှင်။ မေးမြန်းမှုကို ရပ်နားလိုက်ပါပြီ။ သာယာပျော်ရွှင်တဲ့ နေ့လေးတစ်နေ့ ဖြစ်ပါစေရှင်။ ✨")
         return ConversationHandler.END
+
         
     if query.data == "love_method_tarot":
         keyboard = [[InlineKeyboardButton("❌ မမေးတော့ပါ", callback_data="love_cancel")]]
         await query.edit_message_text("လူကြီးမင်းတို့ နှစ်ဦး၏ အချစ်ရေးခရီးလမ်းအတွက် ၁ မှ ၇၈ အတွင်းရှိ ဂဏန်း (၁) ခုကို ရိုက်ထည့်ပေးပါရှင်", reply_markup=InlineKeyboardMarkup(keyboard))
         return TAROT_LOVE_INPUT
-    elif query.data == "love_method_zodiac":
-        await query.edit_message_text("လူကြီးမင်းရဲ့ ရာသီခွင်ကို အောက်ပါစာရင်းမှ ရွေးချယ်ပေးပါရှင်။ ✨", reply_markup=get_zodiac_keyboard("first"))
-        return ZODIAC_FIRST
-
-# --- ၄။ ရာသီခွင် ရွေးချယ်မှုများ (Gender-neutral) ---
-async def zodiac_first_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    sign = query.data.replace("zlove_", "", 1)
-    context.user_data['first_zodiac'] = sign
-    await query.edit_message_text("ကျေးဇူးပြု၍ လူကြီးမင်းရဲ့ ချစ်သူ ရဲ့ ရာသီခွင်ကို ဆက်လက်ရွေးချယ်ပေးပါရှင်။ ✨", reply_markup=get_zodiac_keyboard("second"))
-    return ZODIAC_SECOND
-
-async def zodiac_second_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if query.data == "love_cancel": return await love_cancel_handler(update, context)
-    elif query.data == "zlove_back_first":
-        await query.edit_message_text("လူကြီးမင်းရဲ့ ရာသီခွင်ကို အောက်ပါစာရင်းမှ ရွေးချယ်ပေးပါရှင်။ ✨", reply_markup=get_zodiac_keyboard("first"))
-        return ZODIAC_FIRST
         
-    sign = query.data.replace("zlove_", "", 1)
-    first = context.user_data.get('first_zodiac')
-    pair_key = f"{first}_{sign}"
-    reverse_pair_key = f"{sign}_{first}"
+    elif query.data == "love_method_zodiac":
+        await query.edit_message_text("ကျေးဇူးပြု၍ ယောကျ်ားလေး၏ ရာသီခွင်ကို အောက်ပါစာရင်းမှ ရွေးချယ်ပေးပါရှင် 👦🏻", reply_markup=get_zodiac_keyboard("male"))
+        return ZODIAC_MALE
 
-    context.user_data['zodiac_pair_key'] = pair_key
-    context.user_data['zodiac_reverse_pair_key'] = reverse_pair_key
-    context.user_data['display_pair'] = f"{first} ❤️ {sign}"
+async def love_cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("ဟုတ်ကဲ့ပါရှင်။ မေးမြန်းမှုကို ရပ်နားလိုက်ပါပြီ။ သာယာပျော်ရွှင်တဲ့ နေ့လေးတစ်နေ့ ဖြစ်ပါစေရှင်။ ✨")
+    return ConversationHandler.END
+
+# ==========================================
+# 🃏 TAROT PATH
+# ==========================================
+async def tarot_love_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    user_id = update.effective_user.id
     
-    text = f"လူကြီးမင်း ရွေးချယ်ထားတဲ့ အတွဲလေးက - \n\n✨ {first} နဲ့ {sign} ပါ။✨\n\n မှန်ကန်ပါသလားရှင်။"
+    # Validation စစ်ဆေးခြင်း
+    if not text.isdigit() or not (1 <= int(text) <= 78):
+        await update.message.reply_text("❌ မှားယွင်းနေပါသည်။ ကျေးဇူးပြု၍ ၁ မှ ၇၈ အတွင်းရှိ ဂဏန်းတစ်ခုကိုသာ ရိုက်ထည့်ပေးပါရှင်")
+        return TAROT_LOVE_INPUT
+
+    if not await check_user_credits(user_id):
+        await update.message.reply_text(NO_CREDIT_TEXT)
+        return ConversationHandler.END
+        
+    # ၃။ Credit ၁ ခု ဖြတ်ခြင်း
+    await deduct_credit(user_id)
+    
+
+    # ၄။ Typing နှင့် ⏳ Wait Message ပြခြင်း
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action='typing')
+    wait_msg = await update.message.reply_text("⏳ အချစ်ရေး ဟောကိန်း တွက်ချက်ပေးနေပါသည်... ခေတ္တစောင့်ဆိုင်းပေးပါရှင်...")
+    await asyncio.sleep(2) 
+    
+# ၅။ Random ကဒ်ရွေးချယ်ခြင်း (Data ရှိမရှိ အရင်စစ်မည်)
+    if TAROT_LOVE_DATA:
+        card = random.choice(TAROT_LOVE_DATA)
+    else:
+        # Data မရှိသေးလျှင် ပြမည့် Default
+        card = {
+            "name": "The Lovers (ချစ်သူများ)", 
+            "image_url": "https://upload.wikimedia.org/wikipedia/en/d/de/RWS_Tarot_06_Lovers.jpg", 
+            "love_meaning": "💖 ကောင်းမွန်သော အချစ်ရေးကံကြမ္မာ ဖြစ်ပါသည်။"
+        }
+    
+    # ၇။ ပုံနှင့် Caption (User ၏ Full Name) ကို အရင်ပို့ခြင်း
+    caption = f"✨ {update.effective_user.full_name} ရရှိသောကဒ်"
+    await update.message.reply_photo(photo=card['image_url'], caption=caption, write_timeout=60, read_timeout=60)
+    
+# ၈။ ဟောစာတမ်းနှင့် Review ခလုတ် သီးသန့်ပို့ခြင်း
+    pred_text = f"🃏 ကဒ်အမည် - *{card['name']}*\n\n📜 *ဟောစာတမ်း*\n{card['love_meaning']}"
+    await update.message.reply_text(pred_text, parse_mode="Markdown", write_timeout=60, read_timeout=60)
+    
+    # Review တောင်းခြင်း (မူလ handle_feedback_choice ဆီသို့ ပို့မည်)
+    await update.message.reply_text("Review ပေးလိုပါသလားရှင်?", reply_markup=get_review_keyboard())
+    try: await wait_msg.delete()
+    except: pass
+    return WAIT_FEEDBACK
+
+# ==========================================
+# ♈ ZODIAC PATH
+# ==========================================
+async def zodiac_male_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == "love_cancel":
+        await query.edit_message_text("ဟုတ်ကဲ့ပါရှင်။ မေးမြန်းမှုကို ရပ်နားလိုက်ပါပြီ။ သာယာပျော်ရွှင်တဲ့ နေ့လေးတစ်နေ့ ဖြစ်ပါစေရှင်။ ✨")
+        return ConversationHandler.END
+
+        
+    sign = query.data.split('_')[1]
+    context.user_data['male_zodiac'] = sign
+    
+    # မိန်းကလေး ဆက်ရွေးခိုင်းမည်
+    await query.edit_message_text("ကျေးဇူးပြု၍ မိန်းကလေး၏ ရာသီခွင်ကို ဆက်လက် ရွေးချယ်ပေးပါရှင် 👧🏻", reply_markup=get_zodiac_keyboard("female"))
+    return ZODIAC_FEMALE
+
+async def zodiac_female_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == "love_cancel":
+        await query.edit_message_text("ဟုတ်ကဲ့ပါရှင်။ မေးမြန်းမှုကို ရပ်နားလိုက်ပါပြီ။ သာယာပျော်ရွှင်တဲ့ နေ့လေးတစ်နေ့ ဖြစ်ပါစေရှင်။ ✨")
+        return ConversationHandler.END
+
+    elif query.data == "zlove_back_male":
+        await query.edit_message_text("ကျေးဇူးပြု၍ ယောကျ်ားလေး၏ ရာသီခွင်ကို အောက်ပါစာရင်းမှ ရွေးချယ်ပေးပါရှင် 👦🏻", reply_markup=get_zodiac_keyboard("male"))
+        return ZODIAC_MALE
+        
+    sign = query.data.split('_')[1]
+    context.user_data['female_zodiac'] = sign
+    
+    # အတည်ပြုချက် တောင်းခံခြင်း (Confirmation)
+    male = context.user_data['male_zodiac']
+    female = sign
+    text = (f"လူကြီးမင်း ရွေးချယ်ထားသော ရာသီခွင်များမှာ အောက်ပါအတိုင်း ဖြစ်ပါသည် -\n\n"
+            f"👦🏻 ယောကျ်ားလေး: {male}\n"
+            f"👧🏻 မိန်းကလေး: {female}\n\n"
+            f"မှန်ကန်ပါသလားရှင်?")
+            
     keyboard = [
         [InlineKeyboardButton("✅ မှန်ကန်ပါသည်", callback_data="zlove_confirm_yes")],
-        [InlineKeyboardButton("🔙 ပြန်ရွေးမည်", callback_data="zlove_back_first")],
+        [InlineKeyboardButton("🔙 ရာသီခွင် ပြန်ရွေးမည်", callback_data="zlove_back_male")],
         [InlineKeyboardButton("❌ မမေးတော့ပါ", callback_data="love_cancel")]
     ]
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
     return ZODIAC_CONFIRM
 
-# --- ၅။ Zodiac ဟောစာတမ်း ထုတ်ပြန်ခြင်း (Near/LDR ခွဲခြားမှုပါဝင်သည်) ---
 async def zodiac_confirm_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = update.effective_user.id
@@ -938,80 +928,30 @@ async def zodiac_confirm_process(update: Update, context: ContextTypes.DEFAULT_T
             return ConversationHandler.END
 
         await deduct_credit(user_id)
-        await query.edit_message_text("⏳ နှစ်ဦးသားရဲ့ စွမ်းအင်တွေကို တွက်ချက်နေပါပြီ... ခေတ္တစောင့်ပေးပါရှင်...")
+        await query.edit_message_text("⏳ အချစ်ရေး ဟောကိန်း တွက်ချက်ပေးနေပါသည်... ခေတ္တစောင့်ဆိုင်းပေးပါရှင်...")
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action='typing')
         await asyncio.sleep(2)
         
-        pair_key = context.user_data.get('zodiac_pair_key')
-        display_name = context.user_data.get('display_pair')
-        relation = context.user_data.get('relation_type')
+        male = context.user_data.get('male_zodiac')
+        female = context.user_data.get('female_zodiac')
+        result_data = ZODIAC_LOVE_DATA.get(f"{male}_{female}")
         
-        # Relation အလိုက် Data Source ရွေးခြင်း
-        data_source = ZODIAC_LDR if relation == "ldr" else ZODIAC_NEAR
-        pair_key = context.user_data.get('zodiac_pair_key')
-        reverse_pair_key = context.user_data.get('zodiac_reverse_pair_key')
-        result_data = data_source.get(pair_key) or data_source.get(reverse_pair_key)
-        
-        if result_data:
-            rel_text = "LDR" if relation == "ldr" else "Near"
-            final_text = (
-                f"💘 **{display_name} ({rel_text}) ဟောစာတမ်း**\n\n"
-                f"✨ {result_data['percent']}\n\n"
-                f"💪 **အားသာချက်:**\n{result_data['strength']}\n\n"
-                f"⚠️ **သတိထားရန်:**\n{result_data['weakness']}\n\n"
-                f"💡 **အကြံပြုချက်:**\n{result_data['advice']}\n\n"
-                f"လူကြီးမင်းတို့နှစ်ဦး ပျော်ရွှင်ချမ်းမြေ့ပါစေရှင်။ ✨"
-            )
-        else:
-            final_text = "စိတ်မရှိပါနဲ့ရှင်၊ ဒီအတွဲအတွက် ဟောစာတမ်းကို ပြင်ဆင်နေဆဲမို့ နောက်မှ ပြန်မေးပေးပါဦးရှင်။"
+        if not result_data:
+            result_data = {"percent": "၈၀%", "strength": "နားလည်မှုရှိသည်။", "weakness": "သည်းခံရန်လိုသည်။", "advice": "ပွင့်လင်းစွာ တိုင်ပင်ပါ။"}
 
+        final_text = (f"✨ *{male} နှင့် {female} တွဲဖက်ညီမှု ဟောစာတမ်း*\n\n💘 ကိုက်ညီမှု ရာခိုင်နှုန်း: {result_data['percent']}\n\n💪 အားသာချက်: {result_data['strength']}\n⚠️ သတိထားရန်: {result_data['weakness']}\n💡 အကြံပြုချက်: {result_data['advice']}")
         await query.edit_message_text(final_text, parse_mode="Markdown")
         await context.bot.send_message(chat_id=update.effective_chat.id, text="Review ပေးလိုပါသလားရှင်?", reply_markup=get_review_keyboard())
         return WAIT_FEEDBACK
 
     elif query.data == "love_cancel":
-        await query.edit_message_text("ဟုတ်ကဲ့ပါရှင်။ မေးမြန်းမှုကို ရပ်နားလိုက်ပါပြီ။ သာယာပျော်ရွှင်တဲ့ နေ့လေးတစ်နေ့ ဖြစ်ပါစေရှင်။ ✨")
+        await query.edit_message_text("ဟုတ်ကဲ့ပါရှင်။ မေးမြန်းမှုကို ရပ်နားလိုက်ပါပြီ။ ✨")
         return ConversationHandler.END
-    elif query.data == "zlove_back_first":
-        await query.edit_message_text("လူကြီးမင်းရဲ့ ရာသီခွင်ကို အောက်ပါစာရင်းမှ ပြန်လည်ရွေးချယ်ပေးပါရှင် ✨", reply_markup=get_zodiac_keyboard("first"))
-        return ZODIAC_FIRST
+    elif query.data == "zlove_back_male":
+        await query.edit_message_text("ကျေးဇူးပြု၍ ယောကျ်ားလေး၏ ရာသီခွင်ကို ရွေးချယ်ပေးပါရှင် 👦🏻", reply_markup=get_zodiac_keyboard("male"))
+        return ZODIAC_MALE
 
-# --- ၆။ Tarot အချစ်ရေး ဟောကိန်း (Near/LDR ခွဲခြားမှုပါဝင်သည်) ---
-async def tarot_love_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    user_id = update.effective_user.id
-    
-    if not text.isdigit() or not (1 <= int(text) <= 78):
-        await update.message.reply_text("❌ မှားယွင်းနေပါသည်။ ကျေးဇူးပြု၍ ၁ မှ ၇၈ အတွင်းရှိ ဂဏန်းတစ်ခုကိုသာ ရိုက်ထည့်ပေးပါရှင်")
-        return TAROT_LOVE_INPUT
-
-    if not await check_user_credits(user_id):
-        await update.message.reply_text(NO_CREDIT_TEXT)
-        return ConversationHandler.END
         
-    await deduct_credit(user_id)
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action='typing')
-    wait_msg = await update.message.reply_text("⏳ အချစ်ရေး ဟောကိန်း တွက်ချက်ပေးနေပါသည်... ခေတ္တစောင့်ဆိုင်းပေးပါရှင်...")
-    await asyncio.sleep(2) 
-    
-    relation = context.user_data.get('relation_type')
-    data_list = TAROT_LDR if relation == "ldr" else TAROT_NEAR
-    
-    if data_list:
-        card = random.choice(data_list)
-        rel_text = "LDR" if relation == "ldr" else "Near"
-        caption = f"✨ {update.effective_user.full_name} ရရှိသောကဒ် ({rel_text})"
-        await update.message.reply_photo(photo=card['image_url'], caption=caption)
-        
-        pred_text = f"🃏 ကဒ်အမည် - *{card['name']}*\n\n📜 *ဟောစာတမ်း*\n{card['love_meaning']}"
-        await update.message.reply_text(pred_text, parse_mode="Markdown")
-    else:
-        await update.message.reply_text("❌ ဟောစာတမ်း ဒေတာများ ချိတ်ဆက်ရာတွင် အခက်အခဲရှိနေပါသည်ရှင်။")
-    
-    await update.message.reply_text("Review ပေးလိုပါသလားရှင်?", reply_markup=get_review_keyboard())
-    try: await wait_msg.delete()
-    except: pass
-    return WAIT_FEEDBACK
 
 async def handle_bday(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_typing(update, context)
@@ -1249,44 +1189,18 @@ async def process_reading(update: Update, context: ContextTypes.DEFAULT_TYPE):
     random.shuffle(all_cards) 
     selected = [all_cards[n-1] for n in nums]
 
-# ၃။ ပုံများပို့ခြင်း (Cache System အသုံးပြုထားသည်)
+    # ၃။ ပုံများပို့ခြင်း (Timeout 60s)
     media_group = []
     caption_text = f"{first_name} ရွေးလိုက်သောကဒ်များ"
     for i, card_id in enumerate(selected):
         img_path = f"cards/{card_id}.jpg"
-        
-        if card_id in card_file_cache:
-            media_group.append(
-                  InputMediaPhoto(
-                        card_file_cache[card_id],
-                        caption=caption_text if i == 0 else ""
-                  )
-            )
-
-        elif os.path.exists(img_path):
-            with open(img_path, 'rb') as f:
-                bio = BytesIO(f.read())
-                bio.name = f"{card_id}.jpg"
-
-                media_group.append(
-                      InputMediaPhoto(
-                          media=bio,
-                          caption=caption_text if i == 0 else ""
-                      )
-                )
+        if os.path.exists(img_path):
+            media_group.append(InputMediaPhoto(open(img_path, 'rb'), caption=caption_text if i == 0 else ""))
     
     if media_group:
         try:
             await send_typing(update, context)
-            # sent_messages က ပို့လိုက်တဲ့ ပုံ ၃ ပုံရဲ့ အချက်အလက်တွေကို ပြန်ဖမ်းထားတာပါ
-            sent_messages = await update.message.reply_media_group(media=media_group, write_timeout=60, read_timeout=60)
-            
-            # ပို့ပြီးသွားရင် Cache ထဲ မရှိသေးတဲ့ ပုံတွေရဲ့ file_id ကို ပြန်မှတ်မည်
-            for i, card_id in enumerate(selected):
-                if card_id not in card_file_cache and i < len(sent_messages):
-                    if sent_messages[i].photo:
-                        card_file_cache[card_id] = sent_messages[i].photo[-1].file_id
-
+            await update.message.reply_media_group(media=media_group, write_timeout=60, read_timeout=60)
             await send_typing(update, context)
         except Exception as e:
             logger.error(f"⚠️ Image Timeout: {e}")
@@ -1367,14 +1281,9 @@ async def handle_feedback_choice(update: Update, context: ContextTypes.DEFAULT_T
     await query.answer()
 
     if query.data == "give_review":
-        # 💡 Inline message ကိုဖျက်ပြီး၊ အောက်ခြေ Keyboard အသစ်နဲ့ စာပို့မည်
-        try: await query.message.delete()
-        except: pass
-        
-        instr_msg = await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text="ဟုတ်ကဲ့ပါရှင်။ လူကြီးမင်းရဲ့ Review လေးကို အောက်မှာ စာသားအတိုင်း ရိုက်ပြီး အခုပဲ ပေးပို့ပေးလို့ ရပါပြီရှင်။",
-            reply_markup=cancel_review_kb # 💡 အောက်ခြေတွင် "🚫 မပေးတော့ပါ" ပေါ်လာစေရန်
+        # စာသားတောင်းသည့်စာကို Edit လုပ်ပြီး ယင်း၏ ID ကို မှတ်ထားခြင်း
+        instr_msg = await query.edit_message_text(
+            "ဟုတ်ကဲ့ပါရှင်။ လူကြီးမင်းရဲ့ Review လေးကို အောက်မှာ စာသားအတိုင်း ရိုက်ပြီး အခုပဲ ပေးပို့ပေးလို့ ရပါပြီရှင်။"
         )
         context.user_data['instr_msg_id'] = instr_msg.message_id
         return WAIT_REVIEW_TEXT
@@ -1388,25 +1297,33 @@ async def handle_feedback_choice(update: Update, context: ContextTypes.DEFAULT_T
         )
         return ConversationHandler.END
 
-async def handle_suggestion(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if await check_ban_status(update, context): return ConversationHandler.END
-    await send_typing(update, context)
-    
-    # 💡 စာသားတောင်းသည့်စာကို ပို့ပြီး အောက်ခြေတွင် "🚫 မပေးတော့ပါ" ခလုတ်ပြမည်
-    msg = await update.message.reply_text(
-        "Bot လေး ပိုကောင်းလာအောင် လူကြီးမင်းရဲ့ အကြံပြုချက်လေးတွေကို အောက်မှာ ရိုက်ပို့ပေးနိုင်ပါတယ်ရှင်။",
-        reply_markup=cancel_review_kb 
-    )
-    context.user_data['suggest_instr_id'] = msg.message_id
-    return WAIT_SUGGESTION_TEXT
-
 async def handle_review_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     review_text = update.message.text
     
-    # 💡 "မပေးတော့ပါ" ကိုနှိပ်ခဲ့လျှင် Main Menu ပြန်ခေါ်ပြီး ရပ်မည်
-    if review_text == "🚫 မပေးတော့ပါ":
-        await update.message.reply_text("ဟုတ်ကဲ့ပါရှင်။ နောက်မှပဲ Review ပေးလည်း ရပါတယ်နော်။ ✨", reply_markup=main_kb)
-        return ConversationHandler.END
+    # ခလုတ်စာသားနဲ့ သက်ဆိုင်ရာ Function ချိတ်ဆက်မှု
+    button_handlers = {
+        "🔮 Tarot မေးမည်": tarot_init,
+        "❤️ ချစ်သူနဲ့ကိုက်ညီမှု(RS)": love_start,
+        "🎯 ကံကြမ္မာ လမ်းညွှန်": guide_start,
+        "♈ ရာသီခွင်ပင်ကိုယ်စရိုက်": zodiac_personality_start,
+        "🎂 မွေးနေ့မှတ်မည်": manage_bday,
+        "❓ အသုံးပြုနည်း": handle_help,
+        "✍️ အကြံပြုစာပို့ရန်": handle_suggestion,
+        "📤 Share မည်": share_logic
+    }
+
+    # အကယ်၍ နှိပ်လိုက်တာက Menu ခလုတ်ဖြစ်နေရင် Admin ဆီ Noti မပို့ဘဲ Logic ဆီ တန်းသွားမယ်
+    if review_text in button_handlers:
+        # စာသားတောင်းထားတဲ့ စာဟောင်းကို အရင်ဖျက်မယ်
+        instr_id = context.user_data.get('instr_msg_id')
+        if instr_id:
+            try: await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=instr_id)
+            except: pass
+            
+        # သက်ဆိုင်ရာ Function ကို တိုက်ရိုက် ခေါ်လိုက်တာပါ
+        return await button_handlers[review_text](update, context)
+
+
 
     # ၁။ စာသားတောင်းခဲ့သည့် Bot ၏ စာဟောင်းကို ချက်ချင်းဖျက်ခြင်း
     instr_id = context.user_data.get('instr_msg_id')
@@ -1414,7 +1331,7 @@ async def handle_review_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
         try: await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=instr_id)
         except: pass
 
-    # Admin နှင့် Staff ထံ ပို့ဆောင်ခြင်း
+# Admin နှင့် Staff ထံ ပို့ဆောင်ခြင်း
     user = update.effective_user
     user_link = f'<a href="tg://user?id={user.id}">{user.full_name}</a>'
     report_text = (f"⭐ <b>NEW USER REVIEW</b> ⭐\n\n"
@@ -1424,25 +1341,40 @@ async def handle_review_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     for target_id in [ADMIN_ID, STAFF_ID]:
         try:
-            await context.bot.send_message(chat_id=target_id, text=report_text, parse_mode="HTML")
+            await context.bot.send_message(
+                chat_id=target_id,
+                text=report_text,
+                parse_mode="HTML"
+            )
         except: pass
 
     # ၂။ ကျေးဇူးတင်လွှာ ပို့ခြင်း (User စာကို မဖျက်ပါ)
     confirm_msg = await update.message.reply_text(
         "Review ပေးပို့ပေးတဲ့အတွက် ကျေးဇူးတင်ပါတယ်ရှင်။ လူကြီးမင်းရဲ့ စာကို Admin ဆီကို သေချာ ပေးပို့ထားလိုက်ပါပြီရှင်။",
-        reply_markup=main_kb # 💡 Main Menu ပြန်ဖော်ပေးမည်
+        reply_markup=main_kb
     )
 
+    # ၃။ ကျေးဇူးတင်လွှာကို ၁ မိနစ် (၆၀ စက္ကန့်) အကြာတွင် ဖျက်ခြင်း
     context.job_queue.run_once(delete_old_message, 60, data={'chat_id': update.effective_chat.id, 'message_id': confirm_msg.message_id})
     return ConversationHandler.END
 
+
+# --- handle_suggestion နှင့် handle_suggestion_text ကို တစ်စုတည်း ပြန်ပြင်ထားပါသည် ---
+
+async def handle_suggestion(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await check_ban_status(update, context): return ConversationHandler.END
+    await send_typing(update, context)
+    # စာသားတောင်းသည့်စာကို ပို့ပြီး ID ကို မှတ်ထားခြင်း
+    msg = await update.message.reply_text(
+        "Bot လေး ပိုကောင်းလာအောင် လူကြီးမင်းရဲ့ အကြံပြုချက်လေးတွေကို အောက်မှာ ရိုက်ပို့ပေးနိုင်ပါတယ်ရှင်။",
+        reply_markup=ReplyKeyboardRemove()
+    )
+    context.user_data['suggest_instr_id'] = msg.message_id
+    return WAIT_SUGGESTION_TEXT
+
 async def handle_suggestion_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     suggestion_text = update.message.text
-    
-    # 💡 "မပေးတော့ပါ" ကိုနှိပ်ခဲ့လျှင် Main Menu ပြန်ခေါ်ပြီး ရပ်မည်
-    if suggestion_text == "🚫 မပေးတော့ပါ":
-        await update.message.reply_text("ဟုတ်ကဲ့ပါရှင်။ အခြားလိုအပ်တာရှိရင်လည်း အချိန်မရွေး ဆက်သွယ်နိုင်ပါတယ်နော်။ ✨", reply_markup=main_kb)
-        return ConversationHandler.END
+    # (Menu Logic များ ဤနေရာတွင် ရှိမည်...)
 
     # ၁။ စာသားတောင်းခဲ့သည့် Bot ၏ စာဟောင်းကို ချက်ချင်းဖျက်ခြင်း
     instr_id = context.user_data.get('suggest_instr_id')
@@ -1450,7 +1382,7 @@ async def handle_suggestion_text(update: Update, context: ContextTypes.DEFAULT_T
         try: await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=instr_id)
         except: pass
 
-    # Admin နှင့် Staff ထံ ပို့ဆောင်ခြင်း
+# Admin နှင့် Staff ထံ ပို့ဆောင်ခြင်း
     user = update.effective_user
     user_link = f'<a href="tg://user?id={user.id}">{user.full_name}</a>'
     suggest_report = (f"💡 <b>NEW SUGGESTION</b> 💡\n\n"
@@ -1460,15 +1392,20 @@ async def handle_suggestion_text(update: Update, context: ContextTypes.DEFAULT_T
 
     for target_id in [ADMIN_ID, STAFF_ID]:
         try:
-            await context.bot.send_message(chat_id=target_id, text=suggest_report, parse_mode="HTML")
+            await context.bot.send_message(
+                chat_id=target_id, 
+                text=suggest_report,
+                parse_mode="HTML"
+            )
         except: pass
 
     # ၂။ ကျေးဇူးတင်လွှာ ပို့ခြင်း (User စာကို မဖျက်ပါ)
     confirm_msg = await update.message.reply_text(
         "အကြံပြုချက်အတွက် ကျေးဇူးတင်ပါတယ်ရှင်။ လူကြီးမင်းရဲ့ စာကို Admin ဆီသို့ သေချာ ပေးပို့ထားလိုက်ပါပြီရှင်။",
-        reply_markup=main_kb # 💡 Main Menu ပြန်ဖော်ပေးမည်
+        reply_markup=main_kb 
     )
 
+    # ၃။ ကျေးဇူးတင်လွှာကို ၁ မိနစ်အကြာတွင် ဖျက်ခြင်း
     context.job_queue.run_once(delete_old_message, 60, data={'chat_id': update.effective_chat.id, 'message_id': confirm_msg.message_id})
     return ConversationHandler.END
     
@@ -1477,7 +1414,7 @@ async def share_logic(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await check_ban_status(update, context): return ConversationHandler.END
     await send_typing(update, context)
     
-    full_message = "Tarot မေးချင်ရင် ဒီ Bot လေးစမ်းသုံးကြည့်ပါလား။ တော်တော်အဆင်ပြေတယ်။ @TarotBayDinBot"
+    full_message = "ဒီ tarot botလေးသုံးကြည့် မိုက်တယ်\n@TarotBayDinBot"
     encoded_message = urllib.parse.quote(full_message)
     share_url = f"https://t.me/share/url?url=&text={encoded_message}"
     
@@ -1494,73 +1431,43 @@ async def share_logic(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==========================================================
 
 
+# --- ၁၀။ Admin Commands (Admin သီးသန့် အသုံးပြုရန်) ---
+
+# ၁။ နောက်ကွယ်မှာ စာပို့ပေးမယ့် Function (မူလ Logic များ အားလုံး ပါဝင်သည်)
 async def do_broadcast(context: ContextTypes.DEFAULT_TYPE, users, from_chat_id, message_id, batch_time, admin_id):
-    """User ၂၀ ယောက်တစ်အုပ်စုခွဲ၍ တစ်ပြိုင်နက်ပို့ဆောင်ပေးမည့် Ultra-Fast စနစ်"""
+    """Premium Emoji နှင့် Media အားလုံးကို နောက်ကွယ်မှ ပုံတူကူး၍ ပို့ဆောင်ပေးမည့် Function"""
     success = 0
     fail = 0
-    log_data = []
-    inactive_users = []
-    
-    # ၁။ User စာရင်းကို ၂၀ ယောက်စီ အုပ်စုခွဲလိုက်မည်
-    batch_size = 20 
-    for i in range(0, len(users), batch_size):
-        current_batch = users[i : i + batch_size]
-        
-        # ၂။ အုပ်စုထဲက လူတိုင်းကို တစ်ပြိုင်နက်တည်း ပို့မည့် Task များ တည်ဆောက်ခြင်း
-        tasks = []
-        for u in current_batch:
-            uid = u[0]
-            # ပို့မည့်အလုပ်ကို Task အဖြစ် ပြင်ဆင်ခြင်း
-            tasks.append(context.bot.copy_message(
-                chat_id=uid,
-                from_chat_id=from_chat_id,
-                message_id=message_id,
-                reply_markup=main_kb
-            ))
-            
-        # ၃။ အုပ်စုလိုက် တစ်ပြိုင်နက် ပို့ဆောင်ခြင်း
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-# ၄။ ရလဒ်များကို စစ်ဆေး၍ Log မှတ်သားခြင်း
-        for idx, res in enumerate(results):
-            user_id = current_batch[idx][0]
-            if not isinstance(res, Exception):
-                success += 1
-                log_data.append((user_id, res.message_id, batch_time))
-            else:
-                fail += 1
-                # 💡 User က Bot ကို Block ထားရင် (Forbidden error) is_active ကို ပိတ်မည်
-                if "Forbidden" in str(res):
-                    # ဤနေရာတွင် Database ကို တန်းမသွားဘဲ log_data ကဲ့သို့ 
-                    # inactive_users စာရင်းထဲ ထည့်မှတ်ထားပါမည်
-                    inactive_users.append(user_id)
-                
-        # ၅။ Telegram ရဲ့ Rate Limit ကို လေးစားရန် ၁ စက္ကန့် နားမည်
-        await asyncio.sleep(1.0) 
-
-    # ၆။ အကုန်ပို့ပြီးမှ Database ထဲသို့ တစ်ပြိုင်နက် သိမ်းဆည်းခြင်း (DB Lock Fix)
     conn = db_mgr.get_conn()
     try:
         with conn.cursor() as c:
-            for uid, mid, bt in log_data:
-                c.execute(
-                    "INSERT INTO broadcast_logs (user_id, message_id, batch_id) VALUES (%s, %s, %s)",
-                    (uid, mid, bt)
-                )
-
-            for uid in inactive_users:
-                c.execute(
-                    "UPDATE users SET is_active = FALSE WHERE user_id = %s",
-                    (uid,)
-                )
-
+            for u in users:
+                user_id = u[0]
+                try:
+                    # copy_message သည် Premium Emoji, Photo, Video အားလုံးကို အတိအကျ ပို့ပေးသည်
+                    sent_msg = await context.bot.copy_message(
+                        chat_id=user_id,
+                        from_chat_id=from_chat_id,
+                        message_id=message_id,
+                        reply_markup=main_kb # User ဆီမှာ Menu Keyboard ပြန်ပေါ်စေရန်
+                    )
+                    
+                    # Unpost အတွက် ID သိမ်းဆည်းခြင်း
+                    c.execute("INSERT INTO broadcast_logs (user_id, message_id, batch_id) VALUES (%s, %s, %s)", 
+                              (user_id, sent_msg.message_id, batch_time))
+                    
+                    success += 1
+                    await asyncio.sleep(0.05) # Rate Limit အတွက် ခေတ္တနားခြင်း
+                except Exception:
+                    fail += 1
         conn.commit()
     finally:
         db_mgr.put_conn(conn)
-    # ၇။ Admin ဆီ Report ပို့ခြင်း
+    
+    # Broadcast ပြီးဆုံးမှ Admin ဆီ Report ပို့မည်
     await context.bot.send_message(
         chat_id=admin_id, 
-        text=f"✅ **Broadcast Completed!**\n\nပို့ပြီး: {success} ဦး\nမရသူ: {fail} ဦး\nကြာချိန်: {(datetime.now() - batch_time).seconds} စက္ကန့်",
+        text=f"✅ ကြေညာချက် ပို့ဆောင်မှု ပြီးဆုံးပါပြီ။\n\nအောင်မြင်စွာ ပို့ပြီးသူ: {success} ဦး\nပို့မရသူ: {fail} ဦး",
         parse_mode="Markdown"
     )
 
@@ -1578,13 +1485,11 @@ async def post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target_msg = update.message.reply_to_message
     await update.message.reply_text("⏳ ကြေညာချက်ကို နောက်ကွယ်မှ စတင်ပို့ဆောင်နေပါပြီ။ Bot ကို ပုံမှန်အတိုင်း ဆက်လက်အသုံးပြုနိုင်ပါတယ်ရှင်။")
 
-# User အားလုံး (Active ဖြစ်သူများသာ) ကို Database မှ ဆွဲထုတ်ခြင်း
+    # User အားလုံးကို Database မှ ဆွဲထုတ်ခြင်း
     conn = db_mgr.get_conn()
-    users = []
     try:
         with conn.cursor() as c:
-            # 💡 is_active ဖြစ်ပြီး ban မခံရသေးသူများကိုပဲ ပို့မည်
-            c.execute("SELECT user_id FROM users WHERE is_active = TRUE AND is_banned = FALSE")
+            c.execute("SELECT user_id FROM users")
             users = c.fetchall()
     finally:
         db_mgr.put_conn(conn)
@@ -1761,13 +1666,8 @@ async def send_morning_quote(context: ContextTypes.DEFAULT_TYPE):
     # ခလုတ်အသစ် ထည့်သွင်းခြင်း
     keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🔮 ယနေ့အတွက် ကဒ်ရွေးမည်", callback_data="daily_random_card")]])
 
-    conn = db_mgr.get_conn()
-    try:
-        with conn.cursor() as c:
-            c.execute("SELECT user_id FROM users WHERE is_active = TRUE AND is_banned = FALSE")
-            users = c.fetchall()
-    finally:
-        db_mgr.put_conn(conn)
+    conn = db_mgr.get_conn(); c = conn.cursor()
+    c.execute("SELECT user_id FROM users"); users = c.fetchall(); db_mgr.put_conn(conn)
     
     global DAILY_PHOTO_ID
     photo_path = "cards/daily.jpg" # ဤနေရာတွင် မိမိပုံအမည်ကို ထည့်ပါ
@@ -1790,15 +1690,13 @@ async def send_morning_quote(context: ContextTypes.DEFAULT_TYPE):
                 )
             elif has_photo:
                 # ပထမဆုံးအကြိမ် Upload တင်မည်
-                with open(photo_path, 'rb') as photo:
-                    msg = await context.bot.send_photo(
-                        chat_id=user[0],
-                        photo=photo,
-                        caption=caption_text,
-                        reply_markup=keyboard,
-                        parse_mode="Markdown",
-                        write_timeout=60
-                    )
+                msg = await context.bot.send_photo(
+                    chat_id=user[0], 
+                    photo=open(photo_path, 'rb'),
+                    caption=caption_text,
+                    reply_markup=keyboard,
+                    parse_mode="Markdown"
+                )
                 DAILY_PHOTO_ID = msg.photo[-1].file_id # ID ကို မှတ်ထားမည်
             else:
                 # ပုံမရှိပါက စာသက်သက်သာ ပို့မည် (Fallback)
@@ -1867,26 +1765,16 @@ async def handle_daily_card(update: Update, context: ContextTypes.DEFAULT_TYPE):
     caption = f"🌟 ယနေ့အတွက် လမ်းညွှန်ကဒ်: *{card_name}*"
     
     try:
-        # ၂။ ကဒ်ပုံ သို့မဟုတ် စာသားကို အရင် ပို့မည်
-        if os.path.exists(img_path) or card_id in card_file_cache:
-            # 💡 Cache စစ်ဆေးခြင်း
-            if card_id in card_file_cache:
-                photo_data = card_file_cache[card_id]
-            else:
-                photo_data = open(img_path, 'rb')
-
-            sent_msg = await context.bot.send_photo(
+        # ၂။ ကဒ်ပုံ သို့မဟုတ် စာသားကို အရင် ပို့မည် (reply_markup=main_kb ပါဝင်သည်)
+        if os.path.exists(img_path):
+            await context.bot.send_photo(
                 chat_id=user_id,
-                photo=photo_data,
+                photo=open(img_path, 'rb'),
                 caption=f"{caption}\n\n📝 {daily_prediction}",
                 parse_mode="Markdown",
-                reply_markup=main_kb,
+                reply_markup=main_kb, # ဤနေရာတွင် Menu ပြန်ပေါ်အောင် ထည့်လိုက်ပါသည်
                 write_timeout=60 
             )
-            
-            # 💡 အသစ်တင်လိုက်တာဆိုရင် file_id မှတ်မည်
-            if card_id not in card_file_cache:
-                card_file_cache[card_id] = sent_msg.photo[-1].file_id
         else:
             await context.bot.send_message(
                 chat_id=user_id,
@@ -2018,16 +1906,10 @@ async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn = db_mgr.get_conn(); c = conn.cursor()
         c.execute("UPDATE users SET is_banned = TRUE WHERE user_id = %s", (target_id,))
         conn.commit(); db_mgr.put_conn(conn)
-        
-        # 💡 Target User ရဲ့ Cache ကိုပါ ချက်ချင်း True အဖြစ် Update လုပ်ပေးမည်
-        if target_id not in context.application.user_data:
-            context.application.user_data[target_id] = {}
-        context.application.user_data[target_id]['is_banned'] = True
-        
-        await update.message.reply_text(f"🚫 User {target_id} ကို အသုံးပြုခွင့် ပိတ်လိုက်ပါပြီ။")
+        await update.message.reply_text(f"🚫 User `{target_id}` ကို အသုံးပြုခွင့် ပိတ်လိုက်ပါပြီ။")
     except (IndexError, ValueError):
         await update.message.reply_text("❌ အသုံးပြုပုံ - `/ban USER_ID`")
-        
+
 async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin မှ User ကို ပြန်ဖွင့်ပေးခြင်း"""
     if update.effective_user.id != ADMIN_ID: return
@@ -2036,13 +1918,7 @@ async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn = db_mgr.get_conn(); c = conn.cursor()
         c.execute("UPDATE users SET is_banned = FALSE WHERE user_id = %s", (target_id,))
         conn.commit(); db_mgr.put_conn(conn)
-        
-        # 💡 Target User ရဲ့ Cache ကိုပါ ချက်ချင်း False အဖြစ် ပြန်ဖွင့်ပေးမည်
-        if target_id not in context.application.user_data:
-            context.application.user_data[target_id] = {}
-        context.application.user_data[target_id]['is_banned'] = False
-        
-        await update.message.reply_text(f"✅ User {target_id} ကို အသုံးပြုခွင့် ပြန်ဖွင့်ပေးလိုက်ပါပြီ။")
+        await update.message.reply_text(f"✅ User `{target_id}` ကို အသုံးပြုခွင့် ပြန်ဖွင့်ပေးလိုက်ပါပြီ။")
     except (IndexError, ValueError):
         await update.message.reply_text("❌ အသုံးပြုပုံ - `/unban USER_ID`")
 
@@ -2108,16 +1984,7 @@ async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     init_db()
     actual_token = os.environ.get("BOT_TOKEN", TOKEN)
-    app = (
-    Application.builder()
-    .token(actual_token)
-    .connect_timeout(30)
-    .read_timeout(60)
-    .write_timeout(60)
-    .pool_timeout(60)
-    .concurrent_updates(False)
-    .build()
-    )
+    app = Application.builder().token(actual_token).concurrent_updates(True).build()
     job_queue = app.job_queue
 
     # Automation Jobs (မူလအတိုင်း)
@@ -2170,13 +2037,12 @@ def main():
     love_conv_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(r"^❤️ ချစ်သူနဲ့ကိုက်ညီမှု\(RS\)$"), love_start)],
         states={
-            SELECT_RELATION_TYPE: [CallbackQueryHandler(handle_relation_choice, pattern="^rel_")],
             CHOOSE_LOVE_METHOD: [CallbackQueryHandler(love_method_choice, pattern="^love_method_")],
             TAROT_LOVE_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, tarot_love_input),
                                CallbackQueryHandler(love_cancel_handler, pattern='^love_cancel$')],
-            ZODIAC_FIRST: [CallbackQueryHandler(zodiac_first_choice, pattern="^zlove_")],
-            ZODIAC_SECOND: [CallbackQueryHandler(zodiac_second_choice, pattern="^zlove_")],
-            ZODIAC_CONFIRM: [CallbackQueryHandler(zodiac_confirm_process, pattern="^(zlove_confirm_yes|zlove_back_first|love_cancel)$")],
+            ZODIAC_MALE: [CallbackQueryHandler(zodiac_male_choice, pattern="^zlove_")],
+            ZODIAC_FEMALE: [CallbackQueryHandler(zodiac_female_choice, pattern="^zlove_")],
+            ZODIAC_CONFIRM: [CallbackQueryHandler(zodiac_confirm_process, pattern="^(zlove_confirm_yes|zlove_back_male|love_cancel)$")],
             WAIT_FEEDBACK: [CallbackQueryHandler(handle_feedback_choice, pattern="^(give_review|skip_review)$")],
             WAIT_REVIEW_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_review_text)],
         },
@@ -2204,16 +2070,20 @@ def main():
     app.add_error_handler(error_handler)
 
     print("🚀 Tarot Bot is integrated and starting on Render...")
-    app.run_polling(stop_signals=False)
+    # main() function ရဲ့ အပိတ်နားက run_polling ကို ဒီလိုပြင်ပါ
+    app.run_polling(stop_signals=False, read_timeout=30, write_timeout=30, connect_timeout=30)
 
-# --- Gunicorn နဲ့ Bot ကို တွဲနှိုးပေးမယ့်အပိုင်း ---
-# main() ကို Thread တစ်ခုနဲ့ နောက်ကွယ်မှာ နှိုးထားမှ Gunicorn က ရှေ့ကနေ Web အလုပ်ကို လုပ်နိုင်မှာပါ
-t = Thread(target=main)
-t.daemon = True
-t.start()
+
+# --- အောက်ဆုံးအပိုင်းကို ဒီကုဒ်နဲ့ အစားထိုးပါ ---
 
 if __name__ == "__main__":
-    # ဒါကတော့ local မှာ python tarot.py နဲ့ စမ်းတဲ့အခါ သုံးဖို့ပါ
-    # main() ကို Thread နဲ့ နှိုးထားပြီးသားမို့လို့ ဒီမှာ Flask ကိုပဲ Run ပါမယ်
+    # ၁။ Bot ကို Thread ထဲမှာ ထည့်နှိုးတာကို ဒီ Block ထဲကို ရွှေ့လိုက်ပါ
+    # ဒါဆိုရင် Import လုပ်ရုံနဲ့ Bot instance အပိုတွေ မပွင့်တော့ပါဘူး
+    t = Thread(target=main)
+    t.daemon = True
+    t.start()
+
+    # ၂။ Flask Web Server ကို စတင်မည်
     port = int(os.environ.get("PORT", 10000))
+    print(f"🌍 Web Server starting on port {port}...")
     web_app.run(host='0.0.0.0', port=port)
