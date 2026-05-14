@@ -86,7 +86,18 @@ class DatabaseManager:
             sys.exit(1)
 
     def get_conn(self):
-        return self.pool.getconn()
+        """လမ်းကြောင်းဟောင်း သေနေပါက အသစ်ပြန်ယူမည့် Safe Logic"""
+        try:
+            conn = self.pool.getconn()
+            # လမ်းကြောင်းက အလုပ်လုပ်သေးလား စစ်မည်
+            with conn.cursor() as c:
+                c.execute("SELECT 1")
+            return conn
+        except Exception:
+            # လမ်းကြောင်း သေနေပါက အသစ်ပြန်ချိတ်မည်
+            logger.warning("⚠️ Stale connection detected. Reconnecting...")
+            self.connect()
+            return self.pool.getconn()
 
     def put_conn(self, conn):
         self.pool.putconn(conn)
@@ -2204,13 +2215,13 @@ def main():
     app.run_polling(stop_signals=False)
 
 # --- Gunicorn နဲ့ Bot ကို တွဲနှိုးပေးမယ့်အပိုင်း ---
-# main() ကို Thread တစ်ခုနဲ့ နောက်ကွယ်မှာ နှိုးထားမှ Gunicorn က ရှေ့ကနေ Web အလုပ်ကို လုပ်နိုင်မှာပါ
-t = Thread(target=main)
-t.daemon = True
-t.start()
-
 if __name__ == "__main__":
-    # ဒါကတော့ local မှာ python tarot.py နဲ့ စမ်းတဲ့အခါ သုံးဖို့ပါ
-    # main() ကို Thread နဲ့ နှိုးထားပြီးသားမို့လို့ ဒီမှာ Flask ကိုပဲ Run ပါမယ်
+    # Bot ကို Thread တစ်ခုတည်းနဲ့ သေချာနှိုးတာကို ဒီထဲမှာပဲ ထားပါ
+    t = Thread(target=main)
+    t.daemon = True
+    t.start()
+
+    # Flask Web Server ကို Run မည်
     port = int(os.environ.get("PORT", 10000))
+    print(f"🌍 Web Server starting on port {port}...")
     web_app.run(host='0.0.0.0', port=port)
