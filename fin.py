@@ -733,16 +733,20 @@ async def process_guide_result(update: Update, context: ContextTypes.DEFAULT_TYP
         
         # 💡 Cache ထဲမှာရှိရင် file_id ကိုသုံးမယ်၊ မရှိရင် file ဖွင့်မယ်
         if selected_card_id in card_file_cache:
-            photo_data = card_file_cache[selected_card_id]
+            sent_msg = await update.message.reply_photo(
+                photo=card_file_cache[selected_card_id],
+                caption=caption,
+                parse_mode="Markdown",
+                write_timeout=60
+            )
         else:
-            photo_data = open(img_path, 'rb')
-            
-        sent_msg = await update.message.reply_photo(
-            photo=photo_data, 
-            caption=caption, 
-            parse_mode="Markdown",
-            write_timeout=60
-        )
+            with open(img_path, 'rb') as photo:
+                sent_msg = await update.message.reply_photo(
+                    photo=photo,
+                    caption=caption,
+                    parse_mode="Markdown",
+                    write_timeout=60
+                )
         
         # 💡 အသစ်တင်လိုက်ရတာဆိုရင် နောက်လူတွေအတွက် file_id ကို Cache ထဲ မှတ်ထားလိုက်မယ်
         if selected_card_id not in card_file_cache:
@@ -906,8 +910,11 @@ async def zodiac_second_choice(update: Update, context: ContextTypes.DEFAULT_TYP
         
     sign = query.data.split('_')[1]
     first = context.user_data.get('first_zodiac')
-    sorted_key = "_".join(sorted([first, sign]))
-    context.user_data['zodiac_pair_key'] = sorted_key
+    pair_key = f"{first}_{sign}"
+    reverse_pair_key = f"{sign}_{first}"
+
+    context.user_data['zodiac_pair_key'] = pair_key
+    context.user_data['zodiac_reverse_pair_key'] = reverse_pair_key
     context.user_data['display_pair'] = f"{first} ❤️ {sign}"
     
     text = f"လူကြီးမင်း ရွေးချယ်ထားတဲ့ အတွဲလေးက - \n\n✨ {first} နဲ့ {sign} ပါ။✨\n\n မှန်ကန်ပါသလားရှင်။"
@@ -941,7 +948,9 @@ async def zodiac_confirm_process(update: Update, context: ContextTypes.DEFAULT_T
         
         # Relation အလိုက် Data Source ရွေးခြင်း
         data_source = ZODIAC_LDR if relation == "ldr" else ZODIAC_NEAR
-        result_data = data_source.get(pair_key) 
+        pair_key = context.user_data.get('zodiac_pair_key')
+        reverse_pair_key = context.user_data.get('zodiac_reverse_pair_key')
+        result_data = data_source.get(pair_key) or data_source.get(reverse_pair_key)
         
         if result_data:
             rel_text = "LDR" if relation == "ldr" else "Near"
@@ -1247,11 +1256,24 @@ async def process_reading(update: Update, context: ContextTypes.DEFAULT_TYPE):
         img_path = f"cards/{card_id}.jpg"
         
         if card_id in card_file_cache:
-            # Cache ထဲမှာရှိရင် file_id ကိုသုံးမည်
-            media_group.append(InputMediaPhoto(card_file_cache[card_id], caption=caption_text if i == 0 else ""))
+            media_group.append(
+                  InputMediaPhoto(
+                        card_file_cache[card_id],
+                        caption=caption_text if i == 0 else ""
+                  )
+            )
+
         elif os.path.exists(img_path):
-            # မရှိရင် file ဖွင့်မည်
-            media_group.append(InputMediaPhoto(open(img_path, 'rb'), caption=caption_text if i == 0 else ""))
+            with open(img_path, 'rb') as f:
+                bio = BytesIO(f.read())
+                bio.name = f"{card_id}.jpg"
+
+                media_group.append(
+                      InputMediaPhoto(
+                          media=bio,
+                          caption=caption_text if i == 0 else ""
+                      )
+                )
     
     if media_group:
         try:
@@ -1477,6 +1499,7 @@ async def do_broadcast(context: ContextTypes.DEFAULT_TYPE, users, from_chat_id, 
     success = 0
     fail = 0
     log_data = []
+    inactive_users = []
     
     # ၁။ User စာရင်းကို ၂၀ ယောက်စီ အုပ်စုခွဲလိုက်မည်
     batch_size = 20 
@@ -1520,11 +1543,20 @@ async def do_broadcast(context: ContextTypes.DEFAULT_TYPE, users, from_chat_id, 
     try:
         with conn.cursor() as c:
             for uid, mid, bt in log_data:
-                c.execute("INSERT INTO broadcast_logs (user_id, message_id, batch_id) VALUES (%s, %s, %s)", (uid, mid, bt))
+                c.execute(
+                    "INSERT INTO broadcast_logs (user_id, message_id, batch_id) VALUES (%s, %s, %s)",
+                    (uid, mid, bt)
+                )
+
+            for uid in inactive_users:
+                c.execute(
+                    "UPDATE users SET is_active = FALSE WHERE user_id = %s",
+                    (uid,)
+                )
+
         conn.commit()
     finally:
         db_mgr.put_conn(conn)
-    
     # ၇။ Admin ဆီ Report ပို့ခြင်း
     await context.bot.send_message(
         chat_id=admin_id, 
@@ -1729,8 +1761,13 @@ async def send_morning_quote(context: ContextTypes.DEFAULT_TYPE):
     # ခလုတ်အသစ် ထည့်သွင်းခြင်း
     keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🔮 ယနေ့အတွက် ကဒ်ရွေးမည်", callback_data="daily_random_card")]])
 
-    conn = db_mgr.get_conn(); c = conn.cursor()
-    c.execute("SELECT user_id FROM users"); users = c.fetchall(); db_mgr.put_conn(conn)
+    conn = db_mgr.get_conn()
+    try:
+        with conn.cursor() as c:
+            c.execute("SELECT user_id FROM users WHERE is_active = TRUE AND is_banned = FALSE")
+            users = c.fetchall()
+    finally:
+        db_mgr.put_conn(conn)
     
     global DAILY_PHOTO_ID
     photo_path = "cards/daily.jpg" # ဤနေရာတွင် မိမိပုံအမည်ကို ထည့်ပါ
@@ -1753,13 +1790,15 @@ async def send_morning_quote(context: ContextTypes.DEFAULT_TYPE):
                 )
             elif has_photo:
                 # ပထမဆုံးအကြိမ် Upload တင်မည်
-                msg = await context.bot.send_photo(
-                    chat_id=user[0], 
-                    photo=open(photo_path, 'rb'),
-                    caption=caption_text,
-                    reply_markup=keyboard,
-                    parse_mode="Markdown"
-                )
+                with open(photo_path, 'rb') as photo:
+                    msg = await context.bot.send_photo(
+                        chat_id=user[0],
+                        photo=photo,
+                        caption=caption_text,
+                        reply_markup=keyboard,
+                        parse_mode="Markdown",
+                        write_timeout=60
+                    )
                 DAILY_PHOTO_ID = msg.photo[-1].file_id # ID ကို မှတ်ထားမည်
             else:
                 # ပုံမရှိပါက စာသက်သက်သာ ပို့မည် (Fallback)
@@ -2069,7 +2108,16 @@ async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     init_db()
     actual_token = os.environ.get("BOT_TOKEN", TOKEN)
-    app = Application.builder().token(actual_token).concurrent_updates(True).build()
+    app = (
+    Application.builder()
+    .token(actual_token)
+    .connect_timeout(30)
+    .read_timeout(60)
+    .write_timeout(60)
+    .pool_timeout(60)
+    .concurrent_updates(False)
+    .build()
+    )
     job_queue = app.job_queue
 
     # Automation Jobs (မူလအတိုင်း)
