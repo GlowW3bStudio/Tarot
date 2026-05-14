@@ -2110,14 +2110,10 @@ def main():
     init_db()
     actual_token = os.environ.get("BOT_TOKEN", TOKEN)
     app = (
-    Application.builder()
-    .token(actual_token)
-    .connect_timeout(30)
-    .read_timeout(60)
-    .write_timeout(60)
-    .pool_timeout(60)
-    .concurrent_updates(True)
-    .build()
+        Application.builder()
+        .token(actual_token)
+        .concurrent_updates(True) # Delay မဖြစ်အောင် True ပြန်ပေးပါ
+        .build()
     )
     job_queue = app.job_queue
 
@@ -2205,6 +2201,7 @@ def main():
     app.add_error_handler(error_handler)
 
     print("🚀 Tarot Bot is integrated and starting on Render...")
+    app.run_polling(stop_signals=False)
 
 # --- Gunicorn နဲ့ Bot ကို တွဲနှိုးပေးမယ့်အပိုင်း ---
 # main() ကို Thread တစ်ခုနဲ့ နောက်ကွယ်မှာ နှိုးထားမှ Gunicorn က ရှေ့ကနေ Web အလုပ်ကို လုပ်နိုင်မှာပါ
