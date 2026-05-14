@@ -8,6 +8,7 @@ import random
 import psycopg2
 import urllib.parse
 from psycopg2 import pool
+from io import BytesIO
 from flask import Flask
 from threading import Thread
 from datetime import datetime, time
@@ -78,7 +79,7 @@ class DatabaseManager:
     def connect(self):
         try:
             # URI Link ကို အသုံးပြု၍ ချိတ်ဆက်ခြင်း
-            self.pool = psycopg2.pool.SimpleConnectionPool(1, 15, dsn=DATABASE_URL, sslmode='require')
+            self.pool = psycopg2.pool.SimpleConnectionPool(1, 50, dsn=DATABASE_URL, sslmode='require')
             logger.info("✅ PostgreSQL Connection Pool Established.")
         except Exception as e:
             logger.critical(f"❌ DB Connection Error: {e}")
@@ -2115,7 +2116,7 @@ def main():
     .read_timeout(60)
     .write_timeout(60)
     .pool_timeout(60)
-    .concurrent_updates(False)
+    .concurrent_updates(True)
     .build()
     )
     job_queue = app.job_queue
@@ -2204,7 +2205,13 @@ def main():
     app.add_error_handler(error_handler)
 
     print("🚀 Tarot Bot is integrated and starting on Render...")
-    app.run_polling(stop_signals=False)
+    app.run_polling(
+        stop_signals=False, 
+        read_timeout=60, 
+        write_timeout=60, 
+        connect_timeout=60, 
+        pool_timeout=60
+    )
 
 # --- Gunicorn နဲ့ Bot ကို တွဲနှိုးပေးမယ့်အပိုင်း ---
 # main() ကို Thread တစ်ခုနဲ့ နောက်ကွယ်မှာ နှိုးထားမှ Gunicorn က ရှေ့ကနေ Web အလုပ်ကို လုပ်နိုင်မှာပါ
