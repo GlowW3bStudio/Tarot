@@ -2205,13 +2205,6 @@ def main():
     app.add_error_handler(error_handler)
 
     print("🚀 Tarot Bot is integrated and starting on Render...")
-    app.run_polling(
-        stop_signals=False, 
-        read_timeout=60, 
-        write_timeout=60, 
-        connect_timeout=60, 
-        pool_timeout=60
-    )
 
 # --- Gunicorn နဲ့ Bot ကို တွဲနှိုးပေးမယ့်အပိုင်း ---
 # main() ကို Thread တစ်ခုနဲ့ နောက်ကွယ်မှာ နှိုးထားမှ Gunicorn က ရှေ့ကနေ Web အလုပ်ကို လုပ်နိုင်မှာပါ
