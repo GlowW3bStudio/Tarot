@@ -2071,7 +2071,7 @@ def main():
 
     print("🚀 Tarot Bot is integrated and starting on Render...")
     # main() function ရဲ့ အပိတ်နားက run_polling ကို ဒီလိုပြင်ပါ
-app.run_polling(stop_signals=False, read_timeout=30, write_timeout=30, connect_timeout=30)
+    app.run_polling(stop_signals=False, read_timeout=30, write_timeout=30, connect_timeout=30)
 
 
 # --- အောက်ဆုံးအပိုင်းကို ဒီကုဒ်နဲ့ အစားထိုးပါ ---
