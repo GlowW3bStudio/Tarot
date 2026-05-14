@@ -79,7 +79,7 @@ class DatabaseManager:
     def connect(self):
         try:
             # Thread-safe ဖြစ်စေရန် ThreadedConnectionPool သို့ ပြောင်းပါသည်
-            self.pool = psycopg2.pool.ThreadedConnectionPool(1, 50, dsn=DATABASE_URL, sslmode='require')
+            self.pool = psycopg2.pool.ThreadedConnectionPool(1, 25, dsn=DATABASE_URL, sslmode='require')
             logger.info("✅ PostgreSQL Threaded Connection Pool Established.")
         except Exception as e:
             logger.critical(f"❌ DB Connection Error: {e}")
