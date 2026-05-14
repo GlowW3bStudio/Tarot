@@ -2070,16 +2070,20 @@ def main():
     app.add_error_handler(error_handler)
 
     print("🚀 Tarot Bot is integrated and starting on Render...")
-    app.run_polling(stop_signals=False)
+    # main() function ရဲ့ အပိတ်နားက run_polling ကို ဒီလိုပြင်ပါ
+app.run_polling(stop_signals=False, read_timeout=30, write_timeout=30, connect_timeout=30)
 
-# --- Gunicorn နဲ့ Bot ကို တွဲနှိုးပေးမယ့်အပိုင်း ---
-# main() ကို Thread တစ်ခုနဲ့ နောက်ကွယ်မှာ နှိုးထားမှ Gunicorn က ရှေ့ကနေ Web အလုပ်ကို လုပ်နိုင်မှာပါ
-t = Thread(target=main)
-t.daemon = True
-t.start()
+
+# --- အောက်ဆုံးအပိုင်းကို ဒီကုဒ်နဲ့ အစားထိုးပါ ---
 
 if __name__ == "__main__":
-    # ဒါကတော့ local မှာ python tarot.py နဲ့ စမ်းတဲ့အခါ သုံးဖို့ပါ
-    # main() ကို Thread နဲ့ နှိုးထားပြီးသားမို့လို့ ဒီမှာ Flask ကိုပဲ Run ပါမယ်
+    # ၁။ Bot ကို Thread ထဲမှာ ထည့်နှိုးတာကို ဒီ Block ထဲကို ရွှေ့လိုက်ပါ
+    # ဒါဆိုရင် Import လုပ်ရုံနဲ့ Bot instance အပိုတွေ မပွင့်တော့ပါဘူး
+    t = Thread(target=main)
+    t.daemon = True
+    t.start()
+
+    # ၂။ Flask Web Server ကို စတင်မည်
     port = int(os.environ.get("PORT", 10000))
+    print(f"🌍 Web Server starting on port {port}...")
     web_app.run(host='0.0.0.0', port=port)
