@@ -9,6 +9,7 @@ import psycopg2
 import urllib.parse
 from psycopg2 import pool
 from flask import Flask
+from io import BytesIO
 from threading import Thread
 from datetime import datetime, time
 from telegram import (
@@ -687,13 +688,13 @@ async def process_guide_result(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if os.path.exists(img_path):
         caption = f"✨ {update.effective_user.full_name} ရွေးချယ်လိုက်သောကဒ် - **{card_name}**"
-        await update.message.reply_photo(
-            photo=open(img_path, 'rb'), 
-            caption=caption, 
-            parse_mode="Markdown",
-            write_timeout=60 # Time-out error မဖြစ်အောင် ထည့်သွင်းထားပါသည်
-        )
-    
+        with open(img_path, 'rb') as photo:
+            await update.message.reply_photo(
+                photo=photo,
+                caption=caption,
+                parse_mode="Markdown",
+                write_timeout=60
+            )
     await asyncio.sleep(1)
     await send_typing(update, context)
 
@@ -1189,14 +1190,21 @@ async def process_reading(update: Update, context: ContextTypes.DEFAULT_TYPE):
     random.shuffle(all_cards) 
     selected = [all_cards[n-1] for n in nums]
 
-    # ၃။ ပုံများပို့ခြင်း (Timeout 60s)
     media_group = []
     caption_text = f"{first_name} ရွေးလိုက်သောကဒ်များ"
+
     for i, card_id in enumerate(selected):
         img_path = f"cards/{card_id}.jpg"
         if os.path.exists(img_path):
-            media_group.append(InputMediaPhoto(open(img_path, 'rb'), caption=caption_text if i == 0 else ""))
-    
+            with open(img_path, "rb") as f:
+                bio = BytesIO(f.read())
+                bio.name = f"{card_id}.jpg"
+                media_group.append(
+                    InputMediaPhoto(
+                        media=bio,
+                        caption=caption_text if i == 0 else ""
+                    )
+                )
     if media_group:
         try:
             await send_typing(update, context)
@@ -1765,15 +1773,15 @@ async def handle_daily_card(update: Update, context: ContextTypes.DEFAULT_TYPE):
     caption = f"🌟 ယနေ့အတွက် လမ်းညွှန်ကဒ်: *{card_name}*"
     
     try:
-        # ၂။ ကဒ်ပုံ သို့မဟုတ် စာသားကို အရင် ပို့မည် (reply_markup=main_kb ပါဝင်သည်)
         if os.path.exists(img_path):
-            await context.bot.send_photo(
+            with open(img_path, 'rb') as photo:
+                await context.bot.send_photo(
                 chat_id=user_id,
-                photo=open(img_path, 'rb'),
+                photo=photo,
                 caption=f"{caption}\n\n📝 {daily_prediction}",
                 parse_mode="Markdown",
-                reply_markup=main_kb, # ဤနေရာတွင် Menu ပြန်ပေါ်အောင် ထည့်လိုက်ပါသည်
-                write_timeout=60 
+                reply_markup=main_kb,
+                write_timeout=60
             )
         else:
             await context.bot.send_message(
@@ -1984,7 +1992,16 @@ async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     init_db()
     actual_token = os.environ.get("BOT_TOKEN", TOKEN)
-    app = Application.builder().token(actual_token).concurrent_updates(True).build()
+    app = (
+    Application.builder()
+    .token(actual_token)
+    .connect_timeout(30)
+    .read_timeout(60)
+    .write_timeout(60)
+    .pool_timeout(60)
+    .concurrent_updates(False)
+    .build()
+    )
     job_queue = app.job_queue
 
     # Automation Jobs (မူလအတိုင်း)
@@ -2070,20 +2087,16 @@ def main():
     app.add_error_handler(error_handler)
 
     print("🚀 Tarot Bot is integrated and starting on Render...")
-    # main() function ရဲ့ အပိတ်နားက run_polling ကို ဒီလိုပြင်ပါ
-    app.run_polling(stop_signals=False, read_timeout=30, write_timeout=30, connect_timeout=30)
+    app.run_polling(stop_signals=False)
 
-
-# --- အောက်ဆုံးအပိုင်းကို ဒီကုဒ်နဲ့ အစားထိုးပါ ---
+# --- Gunicorn နဲ့ Bot ကို တွဲနှိုးပေးမယ့်အပိုင်း ---
+# main() ကို Thread တစ်ခုနဲ့ နောက်ကွယ်မှာ နှိုးထားမှ Gunicorn က ရှေ့ကနေ Web အလုပ်ကို လုပ်နိုင်မှာပါ
+t = Thread(target=main)
+t.daemon = True
+t.start()
 
 if __name__ == "__main__":
-    # ၁။ Bot ကို Thread ထဲမှာ ထည့်နှိုးတာကို ဒီ Block ထဲကို ရွှေ့လိုက်ပါ
-    # ဒါဆိုရင် Import လုပ်ရုံနဲ့ Bot instance အပိုတွေ မပွင့်တော့ပါဘူး
-    t = Thread(target=main)
-    t.daemon = True
-    t.start()
-
-    # ၂။ Flask Web Server ကို စတင်မည်
+    # ဒါကတော့ local မှာ python tarot.py နဲ့ စမ်းတဲ့အခါ သုံးဖို့ပါ
+    # main() ကို Thread နဲ့ နှိုးထားပြီးသားမို့လို့ ဒီမှာ Flask ကိုပဲ Run ပါမယ်
     port = int(os.environ.get("PORT", 10000))
-    print(f"🌍 Web Server starting on port {port}...")
     web_app.run(host='0.0.0.0', port=port)
