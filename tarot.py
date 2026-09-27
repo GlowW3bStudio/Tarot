@@ -8,6 +8,7 @@ import random
 import psycopg2
 import urllib.parse
 from psycopg2 import pool
+from psycopg2.extras import execute_values
 from io import BytesIO
 from flask import Flask
 from threading import Thread
@@ -17,9 +18,11 @@ from telegram import (
     InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto
 )
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler, ContextTypes, 
-    filters, ConversationHandler, CallbackQueryHandler
+    Application, CommandHandler, MessageHandler, ContextTypes,
+    filters, ConversationHandler, CallbackQueryHandler, TypeHandler
 )
+
+
 
 
 # Render ရဲ့ Port Scan ကို ကျော်ဖြတ်ရန် Web Server သေးသေးလေး တည်ဆောက်ခြင်း
@@ -59,6 +62,8 @@ user_last_click = {}
 COOLDOWN_SECONDS = 2 # ၂ စက္ကန့်ခြားမှ ဒုတိယတစ်ချက်ကို လက်ခံမည်
 # Tarot ကဒ် ၇၈ ချပ်ရဲ့ File ID များကို မှတ်ထားရန်
 card_file_cache = {}
+# Active users are cached in memory and synchronized with broadcast failures.
+active_user_cache = set()
 
 
 
@@ -104,6 +109,145 @@ class DatabaseManager:
 
 # DB Manager ကို တစ်ခါတည်း သတ်မှတ်ထားခြင်း
 db_mgr = DatabaseManager()
+
+
+# --- Fast, safe DB helpers -------------------------------------------------
+# psycopg2 is synchronous. Async handlers call these helpers through
+# asyncio.to_thread() so database latency does not block the Telegram event loop.
+def _db_fetchone(query, params=()):
+    conn = db_mgr.get_conn()
+    try:
+        with conn.cursor() as c:
+            c.execute(query, params)
+            row = c.fetchone()
+        # Close the read transaction before the pooled connection is reused.
+        conn.rollback()
+        return row
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        db_mgr.put_conn(conn)
+
+
+def _db_fetchall(query, params=()):
+    conn = db_mgr.get_conn()
+    try:
+        with conn.cursor() as c:
+            c.execute(query, params)
+            rows = c.fetchall()
+        conn.rollback()
+        return rows
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        db_mgr.put_conn(conn)
+
+
+def _db_execute(query, params=()):
+    conn = db_mgr.get_conn()
+    try:
+        with conn.cursor() as c:
+            c.execute(query, params)
+            rowcount = c.rowcount
+        conn.commit()
+        return rowcount
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        db_mgr.put_conn(conn)
+
+
+def _ensure_user_active(user_id):
+    """Create a missing user or reactivate an inactive one without touching credits."""
+    conn = db_mgr.get_conn()
+    try:
+        with conn.cursor() as c:
+            c.execute("""
+                INSERT INTO users (
+                    user_id, gift_credits, daily_credits, is_active, last_active
+                )
+                VALUES (%s, %s, %s, TRUE, CURRENT_TIMESTAMP)
+                ON CONFLICT (user_id)
+                DO UPDATE SET
+                    is_active = TRUE,
+                    last_active = CURRENT_TIMESTAMP
+                WHERE users.is_active IS DISTINCT FROM TRUE
+            """, (user_id, GIFT_CREDITS_LIMIT, DAILY_CREDITS_LIMIT))
+        conn.commit()
+        return True
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        db_mgr.put_conn(conn)
+
+
+def _persist_broadcast_results(log_data, inactive_users):
+    """Persist a broadcast with bulk SQL instead of row-by-row writes."""
+    if not log_data and not inactive_users:
+        return
+    conn = db_mgr.get_conn()
+    try:
+        with conn.cursor() as c:
+            if log_data:
+                execute_values(
+                    c,
+                    "INSERT INTO broadcast_logs (user_id, message_id, batch_id) VALUES %s",
+                    log_data,
+                    page_size=1000,
+                )
+            if inactive_users:
+                c.execute(
+                    "UPDATE users SET is_active = FALSE WHERE user_id = ANY(%s)",
+                    (list(inactive_users),),
+                )
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        db_mgr.put_conn(conn)
+
+
+async def _copy_message_with_retry(context, uid, from_chat_id, message_id, max_retries=2):
+    """Retry Telegram flood-control responses while preserving copy_message behavior."""
+    for attempt in range(max_retries + 1):
+        try:
+            return await context.bot.copy_message(
+                chat_id=uid,
+                from_chat_id=from_chat_id,
+                message_id=message_id,
+                reply_markup=main_kb,
+            )
+        except Exception as exc:
+            retry_after = getattr(exc, "retry_after", None)
+            if retry_after is not None and attempt < max_retries:
+                try:
+                    delay = float(retry_after)
+                except (TypeError, ValueError):
+                    delay = 1.0
+                await asyncio.sleep(max(delay, 0.0) + 0.1)
+                continue
+            raise
+
 
 # --- ၃။ Data Loader & Validation ---
 def load_assets():
@@ -273,11 +417,8 @@ def init_db():
     conn = db_mgr.get_conn()
     try:
         with conn.cursor() as c:
-            # ၁။ Users Table မရှိလျှင် အခြေခံဆောက်မည် (DROP TABLE ကို ဖြုတ်လိုက်ပါပြီ) [cite: 2026-04-22]
-            c.execute('''CREATE TABLE IF NOT EXISTS users (user_id BIGINT PRIMARY KEY)''')
-            
-            # ၂။ လိုအပ်သော Column များကို တစ်ခုချင်းစီ စစ်ဆေးပြီး တိုးပေးမည့် Safe Logic [cite: 2026-04-22]
-            # IF NOT EXISTS ပါဝင်သောကြောင့် Column ရှိနှင့်ပြီးသားဆိုလျှင် ဒေတာမပျက်ဘဲ ကျော်သွားပါမည်
+            c.execute("CREATE TABLE IF NOT EXISTS users (user_id BIGINT PRIMARY KEY)")
+
             columns = [
                 ("gift_credits", "INTEGER DEFAULT 7"),
                 ("daily_credits", "INTEGER DEFAULT 3"),
@@ -289,26 +430,57 @@ def init_db():
                 ("is_banned", "BOOLEAN DEFAULT FALSE"),
                 ("is_active", "BOOLEAN DEFAULT TRUE")
             ]
-            
             for col_name, col_type in columns:
-                try:
-                    # PostgreSQL 9.6+ အတွက် ADD COLUMN IF NOT EXISTS ကို သုံးခြင်း [cite: 2026-04-22]
-                    c.execute(f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {col_name} {col_type}")
-                except Exception:
-                    pass # တစ်ခုခုလွဲလျှင်လည်း ကျန်တာများကို ဆက်လုပ်ရန်
+                c.execute(f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {col_name} {col_type}")
 
-            # ၃။ အခြား Table များ (Feedbacks & Logs)
-            c.execute('''CREATE TABLE IF NOT EXISTS feedbacks (
-                id SERIAL PRIMARY KEY, user_id BIGINT, rating TEXT, 
-                comment TEXT, submitted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
-                
-            c.execute('''CREATE TABLE IF NOT EXISTS broadcast_logs (
-                id SERIAL PRIMARY KEY, user_id BIGINT, message_id BIGINT, 
-                batch_id TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
-            
-            conn.commit()
-            logger.info("✅ Database is now SAFE and PERSISTENT. Users won't be deleted again.")
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS feedbacks (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT,
+                    rating TEXT,
+                    comment TEXT,
+                    submitted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS broadcast_logs (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT,
+                    message_id BIGINT,
+                    batch_id TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            # Indexes only improve lookup speed; they do not change data or behavior.
+            c.execute("""
+                CREATE INDEX IF NOT EXISTS idx_users_broadcast_eligible
+                ON users (user_id)
+                WHERE is_active = TRUE AND is_banned = FALSE
+            """)
+            c.execute("""
+                CREATE INDEX IF NOT EXISTS idx_broadcast_logs_batch_id
+                ON broadcast_logs (batch_id)
+            """)
+            c.execute("""
+                CREATE INDEX IF NOT EXISTS idx_users_join_date
+                ON users (join_date)
+            """)
+
+            # Warm active-user cache once at startup.
+            c.execute("SELECT user_id FROM users WHERE is_active = TRUE")
+            active_ids = [row[0] for row in c.fetchall()]
+
+        conn.commit()
+        active_user_cache.clear()
+        active_user_cache.update(active_ids)
+        logger.info(
+            f"✅ Database is now SAFE and PERSISTENT. Active cache: {len(active_user_cache)} users."
+        )
     except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
         logger.error(f"❌ Database Init Error: {e}")
     finally:
         db_mgr.put_conn(conn)
@@ -320,42 +492,56 @@ WAIT_BDAY, WAIT_CAT, WAIT_SUB, WAIT_NUMS, WAIT_FEEDBACK, WAIT_REVIEW_TEXT, WAIT_
 (SELECT_RELATION_TYPE, CHOOSE_LOVE_METHOD, TAROT_LOVE_INPUT, 
  ZODIAC_FIRST, ZODIAC_SECOND, ZODIAC_CONFIRM) = range(20, 26)
 
+
+async def mark_user_active(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    User interaction တစ်ခုခုရှိလာတဲ့အခါ new/inactive user ကိုသာ DB သွားမည်။
+    Active user များကို in-memory cache မှ တိုက်ရိုက်ကျော်မည်။
+    """
+    user = update.effective_user
+    if not user:
+        return
+
+    user_id = user.id
+    if user_id == ADMIN_ID or user_id in active_user_cache:
+        return
+
+    try:
+        await asyncio.to_thread(_ensure_user_active, user_id)
+        active_user_cache.add(user_id)
+    except Exception as e:
+        logger.error(f"mark_user_active error for {user_id}: {e}")
+
 async def check_ban_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """User နှိပ်လိုက်တိုင်း Ban ခံထားရခြင်း ရှိမရှိ စစ်ဆေးမည် (Cache စနစ်ဖြင့်)"""
     user_id = update.effective_user.id
-    # Admin ကို ဘယ်တော့မှ မပိတ်ပါ
     if user_id == ADMIN_ID:
         return False
-        
-    # 💡 ၁။ Cache ထဲမှာ စစ်ထားပြီးသား ရှိမရှိ အရင်ကြည့်မည်
+
     if 'is_banned' in context.user_data:
         is_banned = context.user_data['is_banned']
     else:
-        # 💡 ၂။ Cache ထဲမှာ မရှိမှသာ Database ကို သွားစစ်မည်
-        conn = db_mgr.get_conn()
         is_banned = False
         try:
-            with conn.cursor() as c:
-                c.execute("SELECT is_banned FROM users WHERE user_id = %s", (user_id,))
-                res = c.fetchone()
-                if res and res[0] is True:
-                    is_banned = True
+            res = await asyncio.to_thread(
+                _db_fetchone,
+                "SELECT is_banned FROM users WHERE user_id = %s",
+                (user_id,),
+            )
+            if res and res[0] is True:
+                is_banned = True
         except Exception as e:
             logger.error(f"Ban Check Error: {e}")
-        finally:
-            db_mgr.put_conn(conn)
-            
-        # 💡 ၃။ ရလာတဲ့ရလဒ်ကို နောက်တစ်ခါ ထပ်မစစ်ရအောင် Cache ထဲ မှတ်ထားလိုက်မည်
+
         context.user_data['is_banned'] = is_banned
-        
+
     if is_banned:
-        # Ban ခံရသူဆိုလျှင် ဤစာသာ ပြမည်
         if update.message:
             await update.message.reply_text("❌ လူကြီးမင်းသည် စည်းကမ်းဖောက်ဖျက်မှုကြောင့် အသုံးပြုခွင့် ခေတ္တပိတ်ပင်ခံထားရပါသည်ရှင်။")
         elif update.callback_query:
             await update.callback_query.answer("❌ အသုံးပြုခွင့် ပိတ်ပင်ခံထားရပါသည်။", show_alert=True)
         return True
-        
+
     return False
 
 
@@ -372,59 +558,62 @@ async def cancel_tarot(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 #Creditစစ်တဲ့အပိုင်း
 async def check_user_credits(user_id):
-    if user_id == ADMIN_ID: return True
-    
-    # 💡 Database အလုပ်ကို Background Thread သို့ လွှဲပြောင်းပေးမည့် Local Function
-    def _db_task():
-        conn = db_mgr.get_conn()
-        try:
-            with conn.cursor() as c:
-                # ၁။ အရင်ဆုံး User ရှိမရှိ စစ်မယ်၊ မရှိရင် အသစ်ထည့်ပြီး Credit 7, 3 တန်းပေးမယ်
-                c.execute("""
-                    INSERT INTO users (user_id, gift_credits, daily_credits) 
-                    VALUES (%s, %s, %s) 
-                    ON CONFLICT (user_id) DO NOTHING
-                """, (user_id, GIFT_CREDITS_LIMIT, DAILY_CREDITS_LIMIT))
-                conn.commit()
+    if user_id == ADMIN_ID:
+        return True
 
-                # ၂။ ပြီးမှ Credit ကို ပြန်စစ်မယ်
-                c.execute("SELECT gift_credits, daily_credits FROM users WHERE user_id = %s", (user_id,))
-                res = c.fetchone()
-                if res and (res[0] > 0 or res[1] > 0):
-                    return True
-        except Exception as e:
-            logger.error(f"Credit Check Error: {e}")
-        finally:
-            db_mgr.put_conn(conn)
+    try:
+        # Existing users need one read only. Missing users are inserted once.
+        res = await asyncio.to_thread(
+            _db_fetchone,
+            "SELECT gift_credits, daily_credits FROM users WHERE user_id = %s",
+            (user_id,),
+        )
+
+        if res is None:
+            await asyncio.to_thread(
+                _db_execute,
+                """
+                INSERT INTO users (user_id, gift_credits, daily_credits)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (user_id) DO NOTHING
+                """,
+                (user_id, GIFT_CREDITS_LIMIT, DAILY_CREDITS_LIMIT),
+            )
+            active_user_cache.add(user_id)
+            res = (GIFT_CREDITS_LIMIT, DAILY_CREDITS_LIMIT)
+
+        return bool(res and (res[0] > 0 or res[1] > 0))
+    except Exception as e:
+        logger.error(f"Credit Check Error: {e}")
         return False
 
-    # 💡 Asyncio ကို သုံးပြီး Main Bot မရပ်သွားအောင် Thread ခွဲ၍ Run မည်[span_4](start_span)[span_4](end_span)
-    return await asyncio.to_thread(_db_task)
-
 async def deduct_credit(user_id):
-    if user_id == ADMIN_ID: return
-    
-    # 💡 Credit နှုတ်သည့် အလုပ်ကိုလည်း Thread ဖြင့် ခွဲထုတ်မည်
-    def _db_task():
-        conn = db_mgr.get_conn()
-        try:
-            with conn.cursor() as c:
-                c.execute("SELECT gift_credits, daily_credits FROM users WHERE user_id = %s", (user_id,))
-                res = c.fetchone()
-                if res:
-                    gift, daily = res[0], res[1]
-                    if gift > 0:
-                        c.execute("UPDATE users SET gift_credits = gift_credits - 1 WHERE user_id = %s", (user_id,))
-                    elif daily > 0:
-                        c.execute("UPDATE users SET daily_credits = daily_credits - 1 WHERE user_id = %s", (user_id,))
-            conn.commit()
-        except Exception as e:
-            logger.error(f"Credit Deduction Error: {e}")
-        finally:
-            db_mgr.put_conn(conn)
+    if user_id == ADMIN_ID:
+        return
 
-    # 💡 Thread ခွဲ၍ အလုပ်လုပ်စေမည်[span_6](start_span)[span_6](end_span)
-    await asyncio.to_thread(_db_task)
+    try:
+        # One atomic UPDATE replaces SELECT + UPDATE.
+        await asyncio.to_thread(
+            _db_execute,
+            """
+            UPDATE users
+            SET
+                gift_credits = CASE
+                    WHEN gift_credits > 0 THEN gift_credits - 1
+                    ELSE gift_credits
+                END,
+                daily_credits = CASE
+                    WHEN gift_credits > 0 THEN daily_credits
+                    WHEN daily_credits > 0 THEN daily_credits - 1
+                    ELSE daily_credits
+                END
+            WHERE user_id = %s
+              AND (gift_credits > 0 OR daily_credits > 0)
+            """,
+            (user_id,),
+        )
+    except Exception as e:
+        logger.error(f"Credit Deduction Error: {e}")
 
 async def manage_bday(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """မွေးနေ့ မှတ်သား/ဖျက်သိမ်းရန် ခလုတ်ပြသခြင်း"""
@@ -540,18 +729,16 @@ async def bday_manage_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     query = update.callback_query
     await query.answer()
     user_id = update.effective_user.id
-    
+
     if query.data == "delete_bday_data":
-        conn = db_mgr.get_conn()
-        try:
-            with conn.cursor() as c:
-                c.execute("UPDATE users SET bday_status = FALSE WHERE user_id = %s", (user_id,))
-            conn.commit()
-            await query.edit_message_text("🗑 လူကြီးမင်း မှတ်သားထားတဲ့ မွေးနေ့ဒေတာတွေကို အောင်မြင်စွာ ဖျက်သိမ်းလိုက်ပါပြီရှင်။")
-        finally:
-            db_mgr.put_conn(conn)
+        await asyncio.to_thread(
+            _db_execute,
+            "UPDATE users SET bday_status = FALSE WHERE user_id = %s",
+            (user_id,),
+        )
+        await query.edit_message_text("🗑 လူကြီးမင်း မှတ်သားထားတဲ့ မွေးနေ့ဒေတာတွေကို အောင်မြင်စွာ ဖျက်သိမ်းလိုက်ပါပြီရှင်။")
         return ConversationHandler.END
-        
+
     elif query.data == "save_bday_start":
         await query.edit_message_text(
             "မှတ်သားထားမည့် မွေးသက္ကရာဇ်ကို *(နေ့/လ/ခုနှစ်)* ပုံစံအတိုင်း ရိုက်ပို့ပေးပါဦးရှင်။ ✨\nဥပမာ - *25/12/1995*",
@@ -564,17 +751,17 @@ async def handle_permanent_bday(update: Update, context: ContextTypes.DEFAULT_TY
     await send_typing(update, context)
     text = update.message.text.strip()
     user_id = update.effective_user.id
-    
+
     # (၁) Format နှင့် စာသားပါဝင်မှု စစ်ဆေးခြင်း (Regex ဖြင့် သန့်စင်ခြင်း)
     clean_text = re.sub(r'[/,\-၊\.]', ' ', text).strip()
     parts = clean_text.split()
-    
+
     if len(parts) != 3 or not all(p.isdigit() for p in parts):
         await update.message.reply_text("❌ မွေးသက္ကရာဇ်ကို စာသားများဖြင့် ရေးသား၍မရပါ။ (ဥပမာ - 15/8/1998) ပုံစံအတိုင်း မှန်ကန်စွာ ပြန်လည်ရိုက်နှိပ်ပေးပါရှင်။")
         return WAIT_PERMANENT_BDAY
-        
+
     day, month, year = int(parts[0]), int(parts[1]), int(parts[2])
-    
+
     # Year က ရှေ့ရောက်နေရင် ပြန်စီပေးခြင်း
     if year < 100 and day > 1900:
         day, year = year, day
@@ -615,21 +802,21 @@ async def handle_permanent_bday(update: Update, context: ContextTypes.DEFAULT_TY
     zodiac = calculate_zodiac(day, month)
     context.user_data['zodiac'] = zodiac # Session ထဲ ခေတ္တသိမ်းသည်
 
-    conn = db_mgr.get_conn()
     try:
-        with conn.cursor() as c:
-        # UPSERT Logic: User ID မရှိသေးရင် အသစ်ထည့်မယ်၊ ရှိပြီးသားဆိုရင် Update လုပ်မယ် [cite: 2026-04-22]
-          c.execute("""
-            INSERT INTO users (user_id, birthday, zodiac, bday_status) 
-            VALUES (%s, %s, %s, TRUE) 
-            ON CONFLICT (user_id) 
-            DO UPDATE SET 
-                birthday = EXCLUDED.birthday, 
-                zodiac = EXCLUDED.zodiac, 
+        await asyncio.to_thread(
+            _db_execute,
+            """
+            INSERT INTO users (user_id, birthday, zodiac, bday_status)
+            VALUES (%s, %s, %s, TRUE)
+            ON CONFLICT (user_id)
+            DO UPDATE SET
+                birthday = EXCLUDED.birthday,
+                zodiac = EXCLUDED.zodiac,
                 bday_status = TRUE
-          """, (user_id, text, zodiac))
-          conn.commit()
-        
+            """,
+            (user_id, text, zodiac),
+        )
+
         success_text = (
             f"✅ လူကြီးမင်း၏ မွေးနေ့နှင့် {zodiac} ရာသီဖွားဖြစ်ကြောင်း အောင်မြင်စွာ မှတ်သားပြီးပါပြီရှင်။ ✨\n\n"
             f"ယခုမှစ၍ Tarot မေးတဲ့အခါတိုင်း မွေးနေ့ကို ထပ်ခါထပ်ခါ ရိုက်စရာ မလိုတော့ပါဘူးရှင်။"
@@ -638,8 +825,6 @@ async def handle_permanent_bday(update: Update, context: ContextTypes.DEFAULT_TY
     except Exception as e:
         logger.error(f"Database error in handle_permanent_bday: {e}")
         await update.message.reply_text("❌ အချက်အလက်သိမ်းဆည်းရာတွင် အခက်အခဲရှိနေပါသည်။")
-    finally:
-        db_mgr.put_conn(conn)
 
     return ConversationHandler.END
 
@@ -807,8 +992,8 @@ async def tarot_init(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return # ဘာစာမှမပို့ဘဲ တိတ်တဆိတ် ရပ်လိုက်ခြင်း
     user_last_click[user_id] = now
     # -------------------------------
-    
-    
+
+
     # အဆင့် ၁: Credit ရှိ၊ မရှိ Check Only လုပ်ခြင်း
     if not await check_user_credits(user_id):
         await update.message.reply_text(NO_CREDIT_TEXT)
@@ -816,22 +1001,18 @@ async def tarot_init(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await send_typing(update, context)
 
-  
+
     # --- 💡 ဤနေရာတွင် Database မှ မွေးနေ့ရှိမရှိ စစ်ဆေးမည် ---
-    conn = db_mgr.get_conn()
-    try:
-        with conn.cursor() as c:
-            # bday_status ကိုပါ ဆွဲယူစစ်ဆေးပါ
-            c.execute("SELECT birthday, zodiac, bday_status FROM users WHERE user_id = %s", (user_id,))
-            res = c.fetchone()
-            # res[2] (bday_status) က TRUE ဖြစ်မှသာ မွေးနေ့မတောင်းဘဲ ကျော်ခိုင်းမည်
-            if res and res[0] and res[1] and res[2] is True:
-                context.user_data['birthday'] = res[0]
-                context.user_data['zodiac'] = res[1] 
-                return await show_categories(update, context)
-    finally:
-        db_mgr.put_conn(conn)
-        
+    res = await asyncio.to_thread(
+        _db_fetchone,
+        "SELECT birthday, zodiac, bday_status FROM users WHERE user_id = %s",
+        (user_id,),
+    )
+    if res and res[0] and res[1] and res[2] is True:
+        context.user_data['birthday'] = res[0]
+        context.user_data['zodiac'] = res[1]
+        return await show_categories(update, context)
+
         # 🌟 Cancel Button ထည့်သွင်းထားပါသည် 🌟
     cancel_markup = InlineKeyboardMarkup([[InlineKeyboardButton("❌ မမေးတော့ပါ", callback_data="cancel_tarot")]])
     await update.message.reply_text(
@@ -1208,17 +1389,17 @@ async def process_reading(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     first_name = update.effective_user.first_name
     text = update.message.text
-    
+
     # ဂဏန်း ၃ ခု Validation စစ်ဆေးခြင်း
     # ၁။ ဂဏန်း ၃ ခု Validation စစ်ဆေးခြင်း
     try:
         clean_text = text.replace('၊', ',') 
         nums = [int(n.strip()) for n in re.findall(r'\d+', clean_text)]
-        
+
         # (က) အရေအတွက် ၃ ခု မဟုတ်လျှင် (သို့မဟုတ်) ၁ မှ ၇၈ အပြင်ဘက် ရောက်နေလျှင်
         if len(nums) != 3 or any(n < 1 or n > 78 for n in nums):
             raise ValueError
-            
+
         # (ခ) 💡 ကဒ်များ ထပ်နေခြင်း ရှိ/မရှိ စစ်ဆေးခြင်း (၂ ကဒ်တူတူ၊ ၃ ကဒ်တူတူ လက်မခံပါ)
         if len(set(nums)) != 3:
             await update.message.reply_text(
@@ -1227,7 +1408,7 @@ async def process_reading(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "ကျေးဇူးပြု၍ မတူညီသော ဂဏန်း ၃ ခုကို ပြန်လည်ရိုက်နှိပ်ပေးပါရှင်။ 🙏"
             )
             return WAIT_NUMS
-            
+
     except:
         await update.message.reply_text("❌ ကျေးဇူးပြု၍ ၁ မှ ၇၈ အကြား ဂဏန်း ၃ ခုကို မှန်ကန်စွာ (ဥပမာ - 7, 24, 55) ရိုက်ပေးပါရှင်။")
         return WAIT_NUMS
@@ -1242,17 +1423,18 @@ async def process_reading(update: Update, context: ContextTypes.DEFAULT_TYPE):
     main_key = context.user_data.get('main_cat_key', 'general')
     sub_text = context.user_data.get('sub_cat', 'ယေဘုယျ')
     sub_key = SUB_CAT_MAP.get(sub_text, "general")
-    
+
     # Session ထဲမှာရှိတဲ့ (ခေတ္တရိုက်ထားတဲ့) Zodiac ကို အရင်ယူမည်
     user_zodiac = context.user_data.get('zodiac')
-    
+
     # Session မှာ မရှိမှသာ Database ထဲကဟာကို သွားယူမည် (မှတ်ထားသူများအတွက်)
     if not user_zodiac:
-        conn = db_mgr.get_conn(); c = conn.cursor()
-        c.execute("SELECT zodiac FROM users WHERE user_id = %s", (user_id,))
-        res = c.fetchone()
+        res = await asyncio.to_thread(
+            _db_fetchone,
+            "SELECT zodiac FROM users WHERE user_id = %s",
+            (user_id,),
+        )
         user_zodiac = (res[0] if (res and res[0]) else "Aries").strip().capitalize()
-        db_mgr.put_conn(conn)
     else:
         user_zodiac = user_zodiac.strip().capitalize()
 
@@ -1266,7 +1448,7 @@ async def process_reading(update: Update, context: ContextTypes.DEFAULT_TYPE):
     caption_text = f"{first_name} ရွေးလိုက်သောကဒ်များ"
     for i, card_id in enumerate(selected):
         img_path = f"cards/{card_id}.jpg"
-        
+
         if card_id in card_file_cache:
             media_group.append(
                   InputMediaPhoto(
@@ -1286,13 +1468,13 @@ async def process_reading(update: Update, context: ContextTypes.DEFAULT_TYPE):
                           caption=caption_text if i == 0 else ""
                       )
                 )
-    
+
     if media_group:
         try:
             await send_typing(update, context)
             # sent_messages က ပို့လိုက်တဲ့ ပုံ ၃ ပုံရဲ့ အချက်အလက်တွေကို ပြန်ဖမ်းထားတာပါ
             sent_messages = await update.message.reply_media_group(media=media_group, write_timeout=60, read_timeout=60)
-            
+
             # ပို့ပြီးသွားရင် Cache ထဲ မရှိသေးတဲ့ ပုံတွေရဲ့ file_id ကို ပြန်မှတ်မည်
             for i, card_id in enumerate(selected):
                 if card_id not in card_file_cache and i < len(sent_messages):
@@ -1310,17 +1492,17 @@ async def process_reading(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ၅။ ဟောစာတမ်းစာသား ပေါင်းစပ်ခြင်း
     timeframes = ["အတိတ် (သို့မဟုတ်) အကြောင်းရင်းခံ", "ပစ္စုပ္ပန် (သို့မဟုတ်) လက်ရှိအခြေအနေ", "အနာဂတ် (သို့မဟုတ်) ရှေ့ဆက်ဖြစ်လာနိုင်ခြေ"]
     final_report = f"🔮 *{sub_text} ဟောစာတမ်း*\n\n"
-    
+
     for i, card_id in enumerate(selected):
         card_data = TAROT_DATA.get(card_id, {})
         card_name = card_data.get("name", f"Card {card_id}")
-        
+
         # ယေဘုယျ သို့မဟုတ် အခြား Category ဟောကိန်းဆွဲယူခြင်း
         if main_key == "general":
             meaning = card_data.get("general", "ပြင်ဆင်နေဆဲ")
         else:
             meaning = card_data.get(main_key, {}).get(sub_key, "ပြင်ဆင်နေဆဲ")
-            
+
         final_report += f"📅 *{timeframes[i]}*\n🃏 *ကဒ် {i+1}: {card_name}*\n📝 {meaning}\n\n"
 
         # ၆။ Zodiac Advice Logic (တတိယမြောက်ကဒ်အတွက်သာ)
@@ -1328,7 +1510,7 @@ async def process_reading(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # 💡 ပြင်ဆင်ချက် - လက်ရှိ ကဒ် (card_data) အတွင်းမှ zodiac_rules ကို တိုက်ရိုက်ဆွဲယူခြင်း
             card_zodiac_rules = card_data.get("zodiac_rules", {})
             user_rules = card_zodiac_rules.get(user_zodiac, {})
-            
+
             advice = ""
             if isinstance(user_rules, dict):
                 # အကယ်၍ Category အလိုက် ထပ်ခွဲထားခဲ့လျှင် (ဥပမာ love -> crush)
@@ -1340,7 +1522,7 @@ async def process_reading(update: Update, context: ContextTypes.DEFAULT_TYPE):
             elif isinstance(user_rules, str):
               # တိုက်ရိုက် စာသားအနေဖြင့် ရှိနေခဲ့လျှင်
                 advice = user_rules
-            
+
             # အကြံပြုချက် ရှိခဲ့လျှင် ထည့်သွင်းပေးမည်
             if advice:
                 final_report += f"🌟 *{user_zodiac} ရာသီဖွားများအတွက် အထူးအကြံပြုချက်:*\n{advice}\n\n"
@@ -1507,33 +1689,27 @@ async def share_logic(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def do_broadcast(context: ContextTypes.DEFAULT_TYPE, users, from_chat_id, message_id, batch_time, admin_id):
-    """User ၂၀ ယောက်တစ်အုပ်စုခွဲ၍ တစ်ပြိုင်နက်ပို့ဆောင်ပေးမည့် Ultra-Fast စနစ်"""
+    """User ၂၀ ယောက်တစ်အုပ်စုခွဲ၍ ပို့ပြီး DB results ကို bulk-write လုပ်မည်။"""
     success = 0
     fail = 0
     log_data = []
-    inactive_users = []
-    
-    # ၁။ User စာရင်းကို ၂၀ ယောက်စီ အုပ်စုခွဲလိုက်မည်
-    batch_size = 20 
+    inactive_users = set()
+
+    batch_size = 20
     for i in range(0, len(users), batch_size):
-        current_batch = users[i : i + batch_size]
-        
-        # ၂။ အုပ်စုထဲက လူတိုင်းကို တစ်ပြိုင်နက်တည်း ပို့မည့် Task များ တည်ဆောက်ခြင်း
-        tasks = []
-        for u in current_batch:
-            uid = u[0]
-            # ပို့မည့်အလုပ်ကို Task အဖြစ် ပြင်ဆင်ခြင်း
-            tasks.append(context.bot.copy_message(
-                chat_id=uid,
-                from_chat_id=from_chat_id,
-                message_id=message_id,
-                reply_markup=main_kb
-            ))
-            
-        # ၃။ အုပ်စုလိုက် တစ်ပြိုင်နက် ပို့ဆောင်ခြင်း
+        current_batch = users[i:i + batch_size]
+        tasks = [
+            _copy_message_with_retry(
+                context,
+                u[0],
+                from_chat_id,
+                message_id,
+            )
+            for u in current_batch
+        ]
+
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-# ၄။ ရလဒ်များကို စစ်ဆေး၍ Log မှတ်သားခြင်း
+
         for idx, res in enumerate(results):
             user_id = current_batch[idx][0]
             if not isinstance(res, Exception):
@@ -1541,37 +1717,21 @@ async def do_broadcast(context: ContextTypes.DEFAULT_TYPE, users, from_chat_id, 
                 log_data.append((user_id, res.message_id, batch_time))
             else:
                 fail += 1
-                # 💡 User က Bot ကို Block ထားရင် (Forbidden error) is_active ကို ပိတ်မည်
                 if "Forbidden" in str(res):
-                    # ဤနေရာတွင် Database ကို တန်းမသွားဘဲ log_data ကဲ့သို့ 
-                    # inactive_users စာရင်းထဲ ထည့်မှတ်ထားပါမည်
-                    inactive_users.append(user_id)
-                
-        # ၅။ Telegram ရဲ့ Rate Limit ကို လေးစားရန် ၁ စက္ကန့် နားမည်
-        await asyncio.sleep(1.0) 
+                    inactive_users.add(user_id)
 
-    # ၆။ အကုန်ပို့ပြီးမှ Database ထဲသို့ တစ်ပြိုင်နက် သိမ်းဆည်းခြင်း (DB Lock Fix)
-    conn = db_mgr.get_conn()
+        # Original safe rate is preserved.
+        await asyncio.sleep(1.0)
+
     try:
-        with conn.cursor() as c:
-            for uid, mid, bt in log_data:
-                c.execute(
-                    "INSERT INTO broadcast_logs (user_id, message_id, batch_id) VALUES (%s, %s, %s)",
-                    (uid, mid, bt)
-                )
+        await asyncio.to_thread(_persist_broadcast_results, log_data, inactive_users)
+        if inactive_users:
+            active_user_cache.difference_update(inactive_users)
+    except Exception as e:
+        logger.error(f"Broadcast DB persistence error: {e}")
 
-            for uid in inactive_users:
-                c.execute(
-                    "UPDATE users SET is_active = FALSE WHERE user_id = %s",
-                    (uid,)
-                )
-
-        conn.commit()
-    finally:
-        db_mgr.put_conn(conn)
-    # ၇။ Admin ဆီ Report ပို့ခြင်း
     await context.bot.send_message(
-        chat_id=admin_id, 
+        chat_id=admin_id,
         text=f"✅ **Broadcast Completed!**\n\nပို့ပြီး: {success} ဦး\nမရသူ: {fail} ဦး\nကြာချိန်: {(datetime.now() - batch_time).seconds} စက္ကန့်",
         parse_mode="Markdown"
     )
@@ -1582,7 +1742,6 @@ async def post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
 
-    # Message ကို Reply ပြန်ထားခြင်း ရှိမရှိ စစ်ဆေးခြင်း
     if not update.message.reply_to_message:
         await update.message.reply_text("❌ ပို့ချင်တဲ့ Message (စာသား/ပုံ) ကို အရင်ပို့ပါ။ ပြီးမှ အဲ့ဒီစာကို Reply ပြန်ပြီး /post လို့ ရိုက်ပေးပါရှင်။")
         return
@@ -1590,44 +1749,60 @@ async def post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target_msg = update.message.reply_to_message
     await update.message.reply_text("⏳ ကြေညာချက်ကို နောက်ကွယ်မှ စတင်ပို့ဆောင်နေပါပြီ။ Bot ကို ပုံမှန်အတိုင်း ဆက်လက်အသုံးပြုနိုင်ပါတယ်ရှင်။")
 
-# User အားလုံး (Active ဖြစ်သူများသာ) ကို Database မှ ဆွဲထုတ်ခြင်း
-    conn = db_mgr.get_conn()
-    users = []
-    try:
-        with conn.cursor() as c:
-            # 💡 is_active ဖြစ်ပြီး ban မခံရသေးသူများကိုပဲ ပို့မည်
-            c.execute("SELECT user_id FROM users WHERE is_active = TRUE AND is_banned = FALSE")
-            users = c.fetchall()
-    finally:
-        db_mgr.put_conn(conn)
+    users = await asyncio.to_thread(
+        _db_fetchall,
+        "SELECT user_id FROM users WHERE is_active = TRUE AND is_banned = FALSE",
+    )
 
     batch_time = datetime.now()
-    # အလုပ်ကို Background Task အဖြစ် လွှဲပြောင်းပေးလိုက်ခြင်း (No Delay)
-    asyncio.create_task(do_broadcast(context, users, update.effective_chat.id, target_msg.message_id, batch_time, ADMIN_ID))
+    asyncio.create_task(
+        do_broadcast(
+            context,
+            users,
+            update.effective_chat.id,
+            target_msg.message_id,
+            batch_time,
+            ADMIN_ID,
+        )
+    )
     
 
 async def unpost(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID: return
-    conn = db_mgr.get_conn()
-    try:
-        with conn.cursor() as c:
-            c.execute("SELECT MAX(batch_id) FROM broadcast_logs")
-            last_batch = c.fetchone()[0]
-            if not last_batch: return await update.message.reply_text("❌ ဖျက်စရာ Post မရှိပါဘူးရှင်။")
-            
-            c.execute("SELECT user_id, message_id FROM broadcast_logs WHERE batch_id = %s", (last_batch,))
-            logs = c.fetchall()
-            
-            deleted = 0
-            for u_id, m_id in logs:
-                try:
-                    await context.bot.delete_message(chat_id=u_id, message_id=m_id)
-                    deleted += 1
-                except: continue
-            c.execute("DELETE FROM broadcast_logs WHERE batch_id = %s", (last_batch,))
-        conn.commit()
-        await update.message.reply_text(f"✅ နောက်ဆုံးပို့ထားတဲ့ Post {deleted} ခုကို ပြန်ဖျက်လိုက်ပါပြီရှင်။")
-    finally: db_mgr.put_conn(conn)
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    last_row = await asyncio.to_thread(_db_fetchone, "SELECT MAX(batch_id) FROM broadcast_logs")
+    last_batch = last_row[0] if last_row else None
+    if not last_batch:
+        return await update.message.reply_text("❌ ဖျက်စရာ Post မရှိပါဘူးရှင်။")
+
+    logs = await asyncio.to_thread(
+        _db_fetchall,
+        "SELECT user_id, message_id FROM broadcast_logs WHERE batch_id = %s",
+        (last_batch,),
+    )
+
+    deleted = 0
+    batch_size = 20
+    for i in range(0, len(logs), batch_size):
+        current_batch = logs[i:i + batch_size]
+        results = await asyncio.gather(
+            *[
+                context.bot.delete_message(chat_id=u_id, message_id=m_id)
+                for u_id, m_id in current_batch
+            ],
+            return_exceptions=True,
+        )
+        deleted += sum(1 for result in results if not isinstance(result, Exception))
+        await asyncio.sleep(1.0)
+
+    await asyncio.to_thread(
+        _db_execute,
+        "DELETE FROM broadcast_logs WHERE batch_id = %s",
+        (last_batch,),
+    )
+
+    await update.message.reply_text(f"✅ နောက်ဆုံးပို့ထားတဲ့ Post {deleted} ခုကို ပြန်ဖျက်လိုက်ပါပြီရှင်။")
     
 
 async def send_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1661,27 +1836,26 @@ async def send_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def add_credit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin မှ User တစ်ဦးကို Credit ပေးခြင်း/နှုတ်ခြင်း"""
-    if update.effective_user.id != ADMIN_ID: return
+    if update.effective_user.id != ADMIN_ID:
+        return
 
     try:
         target_id = int(context.args[0])
         amount = int(context.args[1])
-        
-        conn = db_mgr.get_conn(); c = conn.cursor()
-        # GREATEST(0, ...) ကို သုံးထားလို့ ၀ အောက် လုံးဝမကျသွားပါ
-        c.execute("UPDATE users SET gift_credits = GREATEST(0, gift_credits + %s) WHERE user_id = %s", (amount, target_id))
-        conn.commit(); db_mgr.put_conn(conn)
-        
+
+        await asyncio.to_thread(
+            _db_execute,
+            "UPDATE users SET gift_credits = GREATEST(0, gift_credits + %s) WHERE user_id = %s",
+            (amount, target_id),
+        )
+
         await update.message.reply_text(f"✅ User {target_id} ၏ Credit ကို ပြင်ဆင်ပြီးပါပြီ။")
 
-        # --- User ထံသို့ အသိပေးစာ ပို့သည့်အပိုင်း ---
         if amount > 0:
-            # Credit တိုးပေးသည့်အခါ ပြမည့်စာသား
             user_msg = f"🎁 လူကြီးမင်းအတွက် အခမဲ့မေးမြန်းခွင့် ({amount}) ကြိမ် ထည့်သွင်းပေးလိုက်ပါပြီရှင်။ ✨"
         else:
-            # Credit နှုတ်ယူသည့်အခါ ပြမည့်စာသား (abs သုံးထားသဖြင့် အနှုတ်လက္ခဏာ မပါတော့ပါ)
             user_msg = f"ℹ️ လူကြီးမင်း၏ အခမဲ့မေးမြန်းခွင့်ထဲမှ ({abs(amount)}) ကြိမ်ကို ပြန်လည်နှုတ်ယူလိုက်ပါပြီရှင်။"
-            
+
         await context.bot.send_message(chat_id=target_id, text=user_msg)
 
     except (IndexError, ValueError):
@@ -1689,40 +1863,37 @@ async def add_credit(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def gift_all_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin မှ User အားလုံးကို Credit လက်ဆောင် တစ်ပြိုင်နက် ပေးခြင်း"""
-    if update.effective_user.id != ADMIN_ID: # Admin ဟုတ်မှသာ ခွင့်ပြုမည်
+    if update.effective_user.id != ADMIN_ID:
         return
 
     try:
-        # ပေးလိုသော Credit ပမာဏကို ယူခြင်း
         amount = int(context.args[0])
-        
-        conn = db_mgr.get_conn()
         try:
-            with conn.cursor() as c:
-                # User အားလုံး၏ gift_credits ကို တစ်ပြိုင်နက်တည်း Update လုပ်ခြင်း
-                c.execute("UPDATE users SET gift_credits = gift_credits + %s", (amount,))
-            conn.commit()
-            
+            await asyncio.to_thread(
+                _db_execute,
+                "UPDATE users SET gift_credits = gift_credits + %s",
+                (amount,),
+            )
             await update.message.reply_text(f"✅ User အားလုံးထံသို့ Credit ({amount}) ခုစီ လက်ဆောင်ပေးပြီးပါပြီရှင်။")
-            
         except Exception as e:
             logger.error(f"Error in gift_all_users: {e}")
             await update.message.reply_text("❌ Credit ပေးရာတွင် အမှားအယွင်း ဖြစ်ပေါ်ခဲ့ပါသည်။")
-        finally:
-            db_mgr.put_conn(conn)
 
     except (IndexError, ValueError):
         await update.message.reply_text("❌ အသုံးပြုပုံ - /giftall [Credit_ဂဏန်း]`\nဥပမာ - `/giftall 5 (အားလုံးကို ၅ ကြိမ်စီ ပေးမည်)")
 
 async def check_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """User တစ်ဦး၏ အသေးစိတ် အချက်အလက်ကို စစ်ဆေးခြင်း"""
-    if update.effective_user.id != ADMIN_ID: return
+    if update.effective_user.id != ADMIN_ID:
+        return
 
     try:
         target_id = int(context.args[0])
-        conn = db_mgr.get_conn(); c = conn.cursor()
-        c.execute("SELECT gift_credits + daily_credits, birthday, zodiac, join_date FROM users WHERE user_id = %s", (target_id,))
-        res = c.fetchone(); db_mgr.put_conn(conn)
+        res = await asyncio.to_thread(
+            _db_fetchone,
+            "SELECT gift_credits + daily_credits, birthday, zodiac, join_date FROM users WHERE user_id = %s",
+            (target_id,),
+        )
 
         if res:
             msg = (f"👤 *User Info: {target_id}*\n"
@@ -1733,6 +1904,7 @@ async def check_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(msg, parse_mode="Markdown")
         else:
             await update.message.reply_text("❌ အဲ့ဒီ User ကို Database ထဲမှာ ရှာမတွေ့ပါဘူးရှင်။")
+
     except (IndexError, ValueError):
         await update.message.reply_text("❌ အသုံးပြုပုံ - `/check USER_ID`")
         
@@ -1769,27 +1941,24 @@ async def send_morning_quote(context: ContextTypes.DEFAULT_TYPE):
     }
     current_day = datetime.now().weekday()
     quote = day_messages.get(current_day, "မင်္ဂလာရှိသော နေ့သစ်လေး ဖြစ်ပါစေ။")
-    
+
     # ခလုတ်အသစ် ထည့်သွင်းခြင်း
     keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🔮 ယနေ့အတွက် ကဒ်ရွေးမည်", callback_data="daily_random_card")]])
 
-    conn = db_mgr.get_conn()
-    try:
-        with conn.cursor() as c:
-            c.execute("SELECT user_id FROM users WHERE is_active = TRUE AND is_banned = FALSE")
-            users = c.fetchall()
-    finally:
-        db_mgr.put_conn(conn)
-    
+    users = await asyncio.to_thread(
+        _db_fetchall,
+        "SELECT user_id FROM users WHERE is_active = TRUE AND is_banned = FALSE",
+    )
+
     global DAILY_PHOTO_ID
     photo_path = "cards/daily.jpg" # ဤနေရာတွင် မိမိပုံအမည်ကို ထည့်ပါ
     has_photo = os.path.exists(photo_path)
-    
+
     for user in users:
         try:
             # စာသားကို caption အနေဖြင့် ပြင်ဆင်ခြင်း
             caption_text = f"{quote}\n\nဒီနေ့အတွက် လူကြီးမင်းကို လမ်းညွှန်ပေးမယ့် Tarot ကဒ်လေးက ဘာဖြစ်မလဲ? ကံဇာတာကို သိရှိနိုင်ဖို့ အောက်ကခလုတ်လေးကို နှိပ်ပြီး အခမဲ့ ကဒ်နှိုက်ကြည့်လိုက်ပါဦးနော်။ 🃏👇"
-            
+
             # ပုံရှိမရှိ စစ်ဆေးပြီး ပို့ခြင်း
             if DAILY_PHOTO_ID:
                 # ဒုတိယအကြိမ်နှင့် နောက်ပိုင်းအတွက် ID ကိုသုံး၍ အမြန်ပို့မည်
@@ -1820,7 +1989,7 @@ async def send_morning_quote(context: ContextTypes.DEFAULT_TYPE):
                     reply_markup=keyboard,
                     parse_mode="Markdown"
                 )
-            
+
             # ၁၂ နာရီပြည့်လျှင် ဖျက်မည့် Timer (မူလအတိုင်း)
             context.job_queue.run_once(
                 delete_old_message,
@@ -1832,17 +2001,21 @@ async def send_morning_quote(context: ContextTypes.DEFAULT_TYPE):
 
 async def send_daily_stats_to_admin(context: ContextTypes.DEFAULT_TYPE):
     """ညတိုင်း Admin ဆီကို အသေးစိတ် Report ပို့ပေးမည်"""
-    conn = db_mgr.get_conn()
     try:
-        with conn.cursor() as c:
-            # ၁။ စုစုပေါင်း User
-            c.execute("SELECT COUNT(*) FROM users")
-            total_users = c.fetchone()[0]
-            
-            # ၂။ ယနေ့ အသစ်ဝင်လာသော User
-            c.execute("SELECT COUNT(*) FROM users WHERE DATE(join_date) = CURRENT_DATE")
-            new_users_today = c.fetchone()[0]
-            
+        row = await asyncio.to_thread(
+            _db_fetchone,
+            """
+            SELECT
+                COUNT(*),
+                COUNT(*) FILTER (
+                    WHERE join_date >= CURRENT_DATE
+                      AND join_date < CURRENT_DATE + INTERVAL '1 day'
+                )
+            FROM users
+            """,
+        )
+        total_users, new_users_today = row if row else (0, 0)
+
         report_msg = (
             "📊 *Daily Bot Report*\n\n"
             f"👥 စုစုပေါင်း User: {total_users} ဦး\n"
@@ -1850,7 +2023,7 @@ async def send_daily_stats_to_admin(context: ContextTypes.DEFAULT_TYPE):
             "--------------------------\n"
             "Status: All systems running normally ✅"
         )
-        
+
         await context.bot.send_message(
             chat_id=ADMIN_ID,
             text=report_msg,
@@ -1858,18 +2031,16 @@ async def send_daily_stats_to_admin(context: ContextTypes.DEFAULT_TYPE):
         )
     except Exception as e:
         logger.error(f"Failed to send daily stats to admin: {e}")
-    finally:
-        db_mgr.put_conn(conn)
         
         
 async def handle_daily_card(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Daily ကဒ်နှိုက်ခြင်း Logic (စာသားမပြင်ဘဲ Logic နှင့် Menu ပါဝင်အောင် ပြင်ဆင်ပြီး)"""
     query = update.callback_query
     await query.answer()
-    
+
     user_id = update.effective_user.id
     await context.bot.send_chat_action(chat_id=user_id, action='typing')
-    
+
     # ၁။ ကဒ်ဒေတာ ပြင်ဆင်ခြင်း
     card_id = str(random.randint(1, 78))
     card_info = TAROT_DATA.get(card_id, {})
@@ -1877,27 +2048,29 @@ async def handle_daily_card(update: Update, context: ContextTypes.DEFAULT_TYPE):
     daily_prediction = DAILY_TAROT_DATA.get(card_id, "ဒီနေ့အတွက် ဟောစာတမ်း ပြင်ဆင်နေဆဲ ဖြစ်ပါတယ်ရှင်။")
     img_path = f"cards/{card_id}.jpg"
     caption = f"🌟 ယနေ့အတွက် လမ်းညွှန်ကဒ်: *{card_name}*"
-    
+
     try:
         # ၂။ ကဒ်ပုံ သို့မဟုတ် စာသားကို အရင် ပို့မည်
         if os.path.exists(img_path) or card_id in card_file_cache:
-            # 💡 Cache စစ်ဆေးခြင်း
             if card_id in card_file_cache:
-                photo_data = card_file_cache[card_id]
+                sent_msg = await context.bot.send_photo(
+                    chat_id=user_id,
+                    photo=card_file_cache[card_id],
+                    caption=f"{caption}\n\n📝 {daily_prediction}",
+                    parse_mode="Markdown",
+                    reply_markup=main_kb,
+                    write_timeout=60
+                )
             else:
-                photo_data = open(img_path, 'rb')
-
-            sent_msg = await context.bot.send_photo(
-                chat_id=user_id,
-                photo=photo_data,
-                caption=f"{caption}\n\n📝 {daily_prediction}",
-                parse_mode="Markdown",
-                reply_markup=main_kb,
-                write_timeout=60 
-            )
-            
-            # 💡 အသစ်တင်လိုက်တာဆိုရင် file_id မှတ်မည်
-            if card_id not in card_file_cache:
+                with open(img_path, 'rb') as photo_data:
+                    sent_msg = await context.bot.send_photo(
+                        chat_id=user_id,
+                        photo=photo_data,
+                        caption=f"{caption}\n\n📝 {daily_prediction}",
+                        parse_mode="Markdown",
+                        reply_markup=main_kb,
+                        write_timeout=60
+                    )
                 card_file_cache[card_id] = sent_msg.photo[-1].file_id
         else:
             await context.bot.send_message(
@@ -1927,15 +2100,15 @@ async def handle_daily_card(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # (သတိပြုရန် - main() ထဲရှိ job_queue တွင် hour=17, minute=30 ဟု ပြင်ပေးပါ)
 async def reset_daily_credits(context: ContextTypes.DEFAULT_TYPE):
     """ညသန်းခေါင် (UTC 17:30) ရောက်ပါက Daily Credit ကို ၃ ခု ပြန်ညှိမည် (Gift ကို မထိပါ)"""
-    conn = db_mgr.get_conn()
     try:
-        with conn.cursor() as c:
-            # daily_credits ကို ၃ ခုသို့ Reset လုပ်သည် (Rollover မရှိပါ)
-            c.execute("UPDATE users SET daily_credits = %s", (DAILY_CREDITS_LIMIT,))
-        conn.commit()
+        await asyncio.to_thread(
+            _db_execute,
+            "UPDATE users SET daily_credits = %s WHERE daily_credits IS DISTINCT FROM %s",
+            (DAILY_CREDITS_LIMIT, DAILY_CREDITS_LIMIT),
+        )
         logger.info("✅ Daily Credits Reset to 3 for all users.")
-    finally:
-        db_mgr.put_conn(conn)
+    except Exception as e:
+        logger.error(f"Daily credit reset failed: {e}")
 
 
 
@@ -1945,18 +2118,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     full_name = update.effective_user.full_name
     await send_typing(update, context)
 
-    # Database ထဲသို့ User အသစ်ထည့်ခြင်း (Gift 7, Daily 3)
-    conn = db_mgr.get_conn()
-    try:
-        with conn.cursor() as c:
-            c.execute("""
-                INSERT INTO users (user_id, gift_credits, daily_credits) 
-                VALUES (%s, %s, %s) 
-                ON CONFLICT (user_id) DO NOTHING
-            """, (user_id, GIFT_CREDITS_LIMIT, DAILY_CREDITS_LIMIT))
-        conn.commit()
-    finally:
-        db_mgr.put_conn(conn)
+    # TypeHandler normally ensures this first; fallback keeps direct calls safe.
+    if user_id not in active_user_cache:
+        try:
+            await asyncio.to_thread(_ensure_user_active, user_id)
+            active_user_cache.add(user_id)
+        except Exception as e:
+            logger.error(f"Start user activation error for {user_id}: {e}")
 
     welcome_text = (
         f"🌟 *မင်္ဂလာပါ {full_name} ရေ...*\n\n"
@@ -1968,15 +2136,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     global WELCOME_PHOTO_ID
-    photo_path = "cards/welcome.jpg" 
+    photo_path = "cards/welcome.jpg"
     if WELCOME_PHOTO_ID:
         await update.message.reply_photo(photo=WELCOME_PHOTO_ID, caption=welcome_text, parse_mode="Markdown", reply_markup=main_kb)
     elif os.path.exists(photo_path):
-        sent_msg = await update.message.reply_photo(photo=open(photo_path, 'rb'), caption=welcome_text, parse_mode="Markdown", reply_markup=main_kb)
-        WELCOME_PHOTO_ID = sent_msg.photo[-1].file_id 
+        with open(photo_path, 'rb') as photo:
+            sent_msg = await update.message.reply_photo(photo=photo, caption=welcome_text, parse_mode="Markdown", reply_markup=main_kb)
+        WELCOME_PHOTO_ID = sent_msg.photo[-1].file_id
     else:
         await update.message.reply_text(welcome_text, reply_markup=main_kb, parse_mode="Markdown")
-    
+
     return ConversationHandler.END
     
     
@@ -2017,43 +2186,54 @@ async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # Admin Panel Command
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID: return
-    conn = db_mgr.get_conn(); c = conn.cursor()
-    c.execute("SELECT COUNT(*) FROM users"); total = c.fetchone()[0]; db_mgr.put_conn(conn)
-    await update.message.reply_text(f"🛡 *Admin Panel*\n\nUser: {total} ဦး\nStatus: Running ✅", parse_mode="Markdown")
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    row = await asyncio.to_thread(_db_fetchone, "SELECT COUNT(*) FROM users")
+    total = row[0] if row else 0
+    await update.message.reply_text(
+        f"🛡 *Admin Panel*\n\nUser: {total} ဦး\nStatus: Running ✅",
+        parse_mode="Markdown"
+    )
 
 async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin မှ User ကို ပိတ်ပင်ခြင်း"""
-    if update.effective_user.id != ADMIN_ID: return
+    if update.effective_user.id != ADMIN_ID:
+        return
+
     try:
         target_id = int(context.args[0])
-        conn = db_mgr.get_conn(); c = conn.cursor()
-        c.execute("UPDATE users SET is_banned = TRUE WHERE user_id = %s", (target_id,))
-        conn.commit(); db_mgr.put_conn(conn)
-        
-        # 💡 Target User ရဲ့ Cache ကိုပါ ချက်ချင်း True အဖြစ် Update လုပ်ပေးမည်
+        await asyncio.to_thread(
+            _db_execute,
+            "UPDATE users SET is_banned = TRUE WHERE user_id = %s",
+            (target_id,),
+        )
+
         if target_id not in context.application.user_data:
             context.application.user_data[target_id] = {}
         context.application.user_data[target_id]['is_banned'] = True
-        
+
         await update.message.reply_text(f"🚫 User {target_id} ကို အသုံးပြုခွင့် ပိတ်လိုက်ပါပြီ။")
     except (IndexError, ValueError):
         await update.message.reply_text("❌ အသုံးပြုပုံ - `/ban USER_ID`")
         
 async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin မှ User ကို ပြန်ဖွင့်ပေးခြင်း"""
-    if update.effective_user.id != ADMIN_ID: return
+    if update.effective_user.id != ADMIN_ID:
+        return
+
     try:
         target_id = int(context.args[0])
-        conn = db_mgr.get_conn(); c = conn.cursor()
-        c.execute("UPDATE users SET is_banned = FALSE WHERE user_id = %s", (target_id,))
-        conn.commit(); db_mgr.put_conn(conn)
-        
-        # 💡 Target User ရဲ့ Cache ကိုပါ ချက်ချင်း False အဖြစ် ပြန်ဖွင့်ပေးမည်
+        await asyncio.to_thread(
+            _db_execute,
+            "UPDATE users SET is_banned = FALSE WHERE user_id = %s",
+            (target_id,),
+        )
+
         if target_id not in context.application.user_data:
             context.application.user_data[target_id] = {}
         context.application.user_data[target_id]['is_banned'] = False
-        
+
         await update.message.reply_text(f"✅ User {target_id} ကို အသုံးပြုခွင့် ပြန်ဖွင့်ပေးလိုက်ပါပြီ။")
     except (IndexError, ValueError):
         await update.message.reply_text("❌ အသုံးပြုပုံ - `/unban USER_ID`")
@@ -2063,12 +2243,17 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def get_banned_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Ban ထားသော User အရေအတွက် ကြည့်ခြင်း"""
-    if update.effective_user.id != ADMIN_ID: return
-    conn = db_mgr.get_conn(); c = conn.cursor()
-    c.execute("SELECT COUNT(*) FROM users WHERE is_banned = TRUE")
-    count = c.fetchone()[0]
-    db_mgr.put_conn(conn)
-    await update.message.reply_text(f"🚫 လက်ရှိ အသုံးပြုခွင့် ပိတ်ပင်ထားသော User စုစုပေါင်း - ({count}) ဦး ရှိပါသည်။")
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    row = await asyncio.to_thread(
+        _db_fetchone,
+        "SELECT COUNT(*) FROM users WHERE is_banned = TRUE",
+    )
+    count = row[0] if row else 0
+    await update.message.reply_text(
+        f"🚫 လက်ရှိ အသုံးပြုခွင့် ပိတ်ပင်ထားသော User စုစုပေါင်း - ({count}) ဦး ရှိပါသည်။"
+    )
     
 
 async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2135,7 +2320,13 @@ def main():
 
     # --- ၇။ App ထဲသို့ Handlers အားလုံး ထည့်သွင်းခြင်း (Duplication ရှင်းပြီးသား) ---
     
-    # Global Commands
+# User interaction တစ်ခုခုရှိတိုင်း Active ပြန်ဖြစ်စေမည်
+    app.add_handler(
+        TypeHandler(Update, mark_user_active),
+        group=-1
+    )
+
+# Global Commands
     app.add_handler(CommandHandler("help", admin_help))
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("admin", admin_panel))
