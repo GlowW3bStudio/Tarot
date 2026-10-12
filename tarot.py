@@ -12,7 +12,10 @@ from psycopg2.extras import execute_values
 from io import BytesIO
 from flask import Flask
 from threading import Thread
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
+from collections import Counter
+from telegram import MessageEntity, ReplyParameters, LinkPreviewOptions
+from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter
 from telegram import (
     Update, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, 
     InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto
@@ -227,26 +230,100 @@ def _persist_broadcast_results(log_data, inactive_users):
         db_mgr.put_conn(conn)
 
 
-async def _copy_message_with_retry(context, uid, from_chat_id, message_id, max_retries=2):
-    """Retry Telegram flood-control responses while preserving copy_message behavior."""
-    for attempt in range(max_retries + 1):
+def _bc_error_text(exc):
+    # Do not leak bot tokens if a networking exception contains a URL.
+    detail = re.sub(r"\d{5,}:[A-Za-z0-9_-]{20,}", "[TOKEN REDACTED]", str(exc))
+    return f"{type(exc).__name__}: {detail}"[:600]
+
+async def _bc_copy_with_retry(bot, uid, source_chat, source_message, markup):
+    return await _bc_request_with_retry(bot.copy_message, chat_id=uid,
+        from_chat_id=source_chat, message_id=source_message, reply_markup=markup)
+
+async def _bc_request_with_retry(method, **kwargs):
+    for attempt in range(3):
         try:
-            return await context.bot.copy_message(
-                chat_id=uid,
-                from_chat_id=from_chat_id,
-                message_id=message_id,
-                reply_markup=main_kb,
-            )
-        except Exception as exc:
-            retry_after = getattr(exc, "retry_after", None)
-            if retry_after is not None and attempt < max_retries:
-                try:
-                    delay = float(retry_after)
-                except (TypeError, ValueError):
-                    delay = 1.0
-                await asyncio.sleep(max(delay, 0.0) + 0.1)
-                continue
-            raise
+            return await method(**kwargs, connect_timeout=15, read_timeout=30,
+                                write_timeout=30, pool_timeout=15)
+        except RetryAfter as exc:
+            delay = exc.retry_after
+            delay = delay.total_seconds() if isinstance(delay, timedelta) else float(delay)
+            logger.warning("uid=%s retry=%s %s", kwargs['chat_id'], attempt, _bc_error_text(exc))
+            # Long flood waits are reported instead of hanging a local diagnostic.
+            if attempt == 2 or delay > 60:
+                raise
+            await asyncio.sleep(max(0, delay) + 1)
+
+def _bc_formatted_chunks(text, entities, limit=4096):
+    """Preserve all text and UTF-16 entity metadata; never cut a link in half."""
+    boundaries = [0]
+    for char in text:
+        boundaries.append(boundaries[-1] + len(char.encode('utf-16-le')) // 2)
+    positions = {offset: index for index, offset in enumerate(boundaries)}
+    splittable = {'bold', 'italic', 'underline', 'strikethrough', 'spoiler',
+                  'code', 'pre', 'blockquote', 'expandable_blockquote'}
+    for entity in entities:
+        if entity.offset not in positions or entity.offset + entity.length not in positions:
+            raise ValueError('Invalid caption entity boundary; no text sent.')
+        if entity.type not in splittable and entity.length > limit:
+            raise ValueError('A single link/entity exceeds the message limit; shorten it first.')
+    result = []
+    start = 0
+    while start < len(text):
+        end = start
+        while end < len(text) and boundaries[end + 1] - boundaries[start] <= limit:
+            end += 1
+        # Move the boundary before any indivisible link, mention, or emoji.
+        while True:
+            crossing = [e for e in entities if e.type not in splittable
+                        and e.offset < boundaries[end] < e.offset + e.length]
+            if not crossing:
+                break
+            end = min(positions[e.offset] for e in crossing)
+        if end <= start:
+            raise ValueError('Cannot split this caption without damaging its entities.')
+        left, right = boundaries[start], boundaries[end]
+        adjusted = []
+        for entity in entities:
+            lo, hi = max(left, entity.offset), min(right, entity.offset + entity.length)
+            if lo < hi:
+                data = entity.to_dict()
+                data.update(offset=lo-left, length=hi-lo)
+                adjusted.append(MessageEntity.de_json(data, None))
+        result.append((text[start:end], adjusted))
+        start = end
+    return result
+
+class _BroadcastDeliveryError(Exception):
+    def __init__(self, original, sent_ids, stage):
+        self.original = original
+        self.sent_ids = list(sent_ids)
+        super().__init__(f'{stage}; confirmed messages={len(sent_ids)}; {_bc_error_text(original)}')
+
+async def _bc_deliver(bot, uid, source_chat, source_message, markup, photo_plan):
+    if photo_plan is None:
+        result = await _bc_copy_with_retry(bot, uid, source_chat, source_message, markup)
+        return [result.message_id]
+    photo_id, chunks, spoiler = photo_plan
+    sent_ids = []
+    stage = 'photo'
+    try:
+        photo = await _bc_request_with_retry(bot.send_photo, chat_id=uid, photo=photo_id,
+                                         has_spoiler=spoiler)
+        sent_ids.append(photo.message_id)
+        logger.info('Photo confirmed uid=%s message=%s', uid, photo.message_id)
+        for index, (text, entities) in enumerate(chunks):
+            stage = f'text {index+1}/{len(chunks)}'
+            await asyncio.sleep(1.1)
+            msg = await _bc_request_with_retry(bot.send_message, chat_id=uid,
+                text=text, entities=entities, parse_mode=None,
+                reply_parameters=ReplyParameters(message_id=photo.message_id),
+                link_preview_options=LinkPreviewOptions(is_disabled=True),
+                reply_markup=markup if index == len(chunks)-1 else None)
+            sent_ids.append(msg.message_id)
+            logger.info('Text confirmed uid=%s part=%s message=%s', uid, index+1, msg.message_id)
+        return sent_ids
+    except Exception as exc:
+        raise _BroadcastDeliveryError(exc, sent_ids, stage) from exc
 
 
 # --- ၃။ Data Loader & Validation ---
@@ -1688,122 +1765,223 @@ async def share_logic(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==========================================================
 
 
-async def do_broadcast(context: ContextTypes.DEFAULT_TYPE, users, from_chat_id, message_id, batch_time, admin_id):
-    """User ၂၀ ယောက်တစ်အုပ်စုခွဲ၍ ပို့ပြီး DB results ကို bulk-write လုပ်မည်။"""
-    success = 0
-    fail = 0
-    log_data = []
-    inactive_users = set()
+async def do_broadcast(context: ContextTypes.DEFAULT_TYPE, users, from_chat_id,
+                       message_id, batch_time, admin_id, photo_plan=None):
+    """Batch short posts; deliver split photo/text posts sequentially."""
+    success = failed = partial = uncertain = 0
+    attempted = 0
+    errors = Counter()
+    pending = []
+    inactive = set()
+    stopped = False
+    db_problem = False
+    recipients = [row[0] for row in users if row[0] != admin_id]
+    consecutive = 0
+    last_error = None
 
-    batch_size = 20
-    for i in range(0, len(users), batch_size):
-        current_batch = users[i:i + batch_size]
-        tasks = [
-            _copy_message_with_retry(
-                context,
-                u[0],
-                from_chat_id,
-                message_id,
-            )
-            for u in current_batch
-        ]
+    def record(uid, ids):
+        pending.extend((uid, mid, batch_time) for mid in ids)
 
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        for idx, res in enumerate(results):
-            user_id = current_batch[idx][0]
-            if not isinstance(res, Exception):
-                success += 1
-                log_data.append((user_id, res.message_id, batch_time))
-            else:
-                fail += 1
-                if "Forbidden" in str(res):
-                    inactive_users.add(user_id)
-
-        # Original safe rate is preserved.
-        await asyncio.sleep(1.0)
+    async def flush():
+        nonlocal db_problem
+        if not pending and not inactive:
+            return True
+        try:
+            await asyncio.to_thread(_persist_broadcast_results, pending, inactive)
+            active_user_cache.difference_update(inactive)
+            pending.clear()
+            inactive.clear()
+            return True
+        except Exception as exc:
+            db_problem = True
+            logger.error("Broadcast persistence failed: %s", _bc_error_text(exc))
+            # Preserve confirmed message IDs for recovery; do not blindly retry a
+            # possibly committed SQL insert and risk duplicating log rows.
+            recovery = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                'broadcast_recovery_' + batch_time.strftime('%Y%m%d_%H%M%S_%f') + '.json')
+            try:
+                with open(recovery, 'w', encoding='utf-8') as handle:
+                    json.dump({'batch_id': batch_time.isoformat(),
+                               'messages': [(uid, mid) for uid, mid, _ in pending],
+                               'inactive_users': sorted(inactive)}, handle)
+                logger.error("Confirmed message IDs saved to %s", recovery)
+            except OSError as save_exc:
+                logger.error("Recovery save failed: %s; confirmed messages=%s",
+                             _bc_error_text(save_exc), [(u, m) for u, m, _ in pending])
+            return False
 
     try:
-        await asyncio.to_thread(_persist_broadcast_results, log_data, inactive_users)
-        if inactive_users:
-            active_user_cache.difference_update(inactive_users)
-    except Exception as e:
-        logger.error(f"Broadcast DB persistence error: {e}")
+        try:
+            ids = await _bc_deliver(context.bot, admin_id, from_chat_id, message_id,
+                                   main_kb, photo_plan)
+            record(admin_id, ids)
+        except Exception as exc:
+            if isinstance(exc, _BroadcastDeliveryError):
+                record(admin_id, exc.sent_ids)
+            detail = _bc_error_text(exc)
+            logger.error("Broadcast preflight failed: %s", detail)
+            await context.bot.send_message(chat_id=admin_id, text=(
+                "❌ Admin ဆီ စမ်းပို့မှု မအောင်မြင်ပါ။ အခြား user များဆီ မပို့ထားပါ။\n" + detail))
+            return
+        if not await flush():
+            await context.bot.send_message(chat_id=admin_id,
+                text="❌ Broadcast log သိမ်းမရသဖြင့် ရပ်ထားပါသည်။ အခြားသူများဆီ မပို့ထားပါ။ Server log ကို စစ်ပါ။")
+            return
 
-    await context.bot.send_message(
-        chat_id=admin_id,
-        text=f"✅ **Broadcast Completed!**\n\nပို့ပြီး: {success} ဦး\nမရသူ: {fail} ဦး\nကြာချိန်: {(datetime.now() - batch_time).seconds} စက္ကန့်",
-        parse_mode="Markdown"
-    )
+        # Short posts use the original 20-recipient batches. A split caption
+        # completes photo and all text for one recipient before starting another.
+        batch_size = 1 if photo_plan is not None else 20
+        for offset in range(0, len(recipients), batch_size):
+            await asyncio.sleep(0.1 if photo_plan is not None else 1.0)
+            current = recipients[offset:offset + batch_size]
+            results = await asyncio.gather(*(
+                _bc_deliver(context.bot, uid, from_chat_id, message_id, main_kb, photo_plan)
+                for uid in current
+            ), return_exceptions=True)
+            # All in-flight results must be counted/logged, even if an earlier
+            # result triggers a stop. The stop applies before the next batch.
+            for uid, result in zip(current, results):
+                attempted += 1
+                if not isinstance(result, Exception):
+                    ids = result
+                    record(uid, ids)
+                    success += 1
+                    consecutive = 0
+                    last_error = None
+                else:
+                    exc = result
+                    cause = exc.original if isinstance(exc, _BroadcastDeliveryError) else exc
+                    if isinstance(exc, _BroadcastDeliveryError):
+                        record(uid, exc.sent_ids)
+                    detail = _bc_error_text(exc)
+                    errors[detail] += 1
+                    logger.warning("Broadcast uid=%s %s", uid, detail)
+                    if isinstance(exc, _BroadcastDeliveryError) and exc.sent_ids:
+                        partial += 1
+                    elif isinstance(cause, NetworkError) and not isinstance(cause, BadRequest):
+                        uncertain += 1
+                    else:
+                        failed += 1
+                    if isinstance(cause, Forbidden):
+                        inactive.add(uid)
+                    # Recipient-specific blocked accounts must not stop a healthy broadcast.
+                    if isinstance(cause, Forbidden):
+                        consecutive = 0
+                        last_error = None
+                    else:
+                        consecutive = consecutive + 1 if detail == last_error else 1
+                        last_error = detail
+                    if isinstance(cause, RetryAfter) or consecutive >= 3:
+                        stopped = True
+            if attempted % 20 == 0 or stopped:
+                if not await flush():
+                    stopped = True
+            if stopped:
+                break
 
-# ၂။ Admin Command ကို လက်ခံပြီး Background အလုပ် စတင်ပေးမည့် Function
+        if not db_problem and not await flush():
+            stopped = True
+        title = "⏸ Broadcast Stopped" if stopped else (
+            "⚠️ Broadcast Completed with errors" if failed or partial or uncertain else "✅ Broadcast Completed!")
+        report = (
+            f"{title}\n\nAdmin စမ်းပို့မှု: အောင်မြင် (အောက်ပါစာရင်းတွင် မပါ)\n"
+            f"ပို့ပြီး: {success} ဦး\nမရသူ: {failed} ဦး\n"
+            f"တစ်စိတ်တစ်ပိုင်းသာ အတည်ပြုရသူ: {partial} ဦး\n"
+            f"ရောက်/မရောက် မသေချာ: {uncertain} ဦး\n"
+            f"မပို့ဖြစ်သူ: {len(recipients)-attempted} ဦး\n"
+            f"ကြာချိန်: {int((datetime.now()-batch_time).total_seconds())} စက္ကန့်\n"
+        )
+        for detail, count in errors.most_common(3):
+            report += f"\n{count} × {detail}\n"
+        if db_problem:
+            report += "\n⚠️ Database log သိမ်းမရပါ။ /unpost ဖြင့် အားလုံးမဖျက်နိုင်ပါ။ Server recovery log ကို စစ်ပါ။"
+        await context.bot.send_message(chat_id=admin_id, text=report)
+    finally:
+        try:
+            if not db_problem:
+                await flush()
+        finally:
+            context.bot_data['broadcast_busy'] = False
+
+
 async def post(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin ပို့လိုက်သော Message ကို Reply ပြန်၍ User အားလုံးထံ ဖြန့်ဝေခြင်း"""
     if update.effective_user.id != ADMIN_ID:
         return
-
-    if not update.message.reply_to_message:
-        await update.message.reply_text("❌ ပို့ချင်တဲ့ Message (စာသား/ပုံ) ကို အရင်ပို့ပါ။ ပြီးမှ အဲ့ဒီစာကို Reply ပြန်ပြီး /post လို့ ရိုက်ပေးပါရှင်။")
+    if context.bot_data.get('broadcast_busy') or context.bot_data.get('unpost_busy'):
+        await update.message.reply_text("⏳ Post ပို့ခြင်း/ဖျက်ခြင်း လုပ်နေဆဲပါ။ ပြီးမှ ထပ်လုပ်ပါ။")
         return
-
     target_msg = update.message.reply_to_message
-    await update.message.reply_text("⏳ ကြေညာချက်ကို နောက်ကွယ်မှ စတင်ပို့ဆောင်နေပါပြီ။ Bot ကို ပုံမှန်အတိုင်း ဆက်လက်အသုံးပြုနိုင်ပါတယ်ရှင်။")
+    if target_msg is None:
+        await update.message.reply_text("❌ ပို့ချင်သောစာ/ပုံကို Reply လုပ်ပြီး /post ရိုက်ပါ။")
+        return
+    if target_msg.media_group_id:
+        await update.message.reply_text("❌ Album မသုံးပါ။ ပုံတစ်ပုံတည်း ပြန်ပို့ပြီး /post လုပ်ပါ။")
+        return
+    photo_plan = None
+    if target_msg.caption and len(target_msg.caption.encode('utf-16-le')) // 2 > 1024:
+        if not target_msg.photo:
+            await update.message.reply_text("❌ Caption ရှည်တာကို ခွဲပို့ခြင်းသည် ပုံတစ်ပုံအတွက်သာ ရပါသည်။")
+            return
+        try:
+            chunks = _bc_formatted_chunks(target_msg.caption, target_msg.caption_entities or ())
+        except ValueError as exc:
+            await update.message.reply_text(_bc_error_text(exc))
+            return
+        photo_plan = (target_msg.photo[-1].file_id, chunks, bool(target_msg.has_media_spoiler))
+    # Set before the first await: concurrent update handlers cannot start two runs.
+    context.bot_data['broadcast_busy'] = True
+    try:
+        users = await asyncio.to_thread(_db_fetchall,
+            "SELECT user_id FROM users WHERE is_active = TRUE AND is_banned = FALSE")
+        mode = "ပုံအရင်၊ စာနောက်မှ တစ်ယောက်ချင်း ပို့ပါမယ်။" if photo_plan else "မူရင်းစာ/ပုံကို လူ ၂၀ စီ ပို့ပါမယ်။"
+        await update.message.reply_text("⏳ Admin ဆီအရင်စမ်းပို့ပြီး စတင်ပါမယ်။\n" + mode)
+        context.application.create_task(do_broadcast(context, users, update.effective_chat.id,
+            target_msg.message_id, datetime.now(), ADMIN_ID, photo_plan), update=update)
+    except BaseException:
+        context.bot_data['broadcast_busy'] = False
+        raise
 
-    users = await asyncio.to_thread(
-        _db_fetchall,
-        "SELECT user_id FROM users WHERE is_active = TRUE AND is_banned = FALSE",
-    )
-
-    batch_time = datetime.now()
-    asyncio.create_task(
-        do_broadcast(
-            context,
-            users,
-            update.effective_chat.id,
-            target_msg.message_id,
-            batch_time,
-            ADMIN_ID,
-        )
-    )
-    
 
 async def unpost(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
+    if context.bot_data.get('broadcast_busy') or context.bot_data.get('unpost_busy'):
+        await update.message.reply_text("⏳ Post ပို့ခြင်း/ဖျက်ခြင်း လုပ်နေဆဲပါ။ ပြီးမှ ထပ်လုပ်ပါ။")
+        return
+    context.bot_data['unpost_busy'] = True
+    try:
+        last_row = await asyncio.to_thread(_db_fetchone, "SELECT MAX(batch_id) FROM broadcast_logs")
+        last_batch = last_row[0] if last_row else None
+        if not last_batch:
+            await update.message.reply_text("❌ ဖျက်စရာ Post မရှိပါဘူးရှင်။")
+            return
+        logs = await asyncio.to_thread(_db_fetchall,
+            "SELECT user_id, message_id FROM broadcast_logs WHERE batch_id = %s", (last_batch,))
+        deleted = 0
+        remaining = 0
+        for uid, mid in logs:
+            try:
+                await _bc_request_with_retry(context.bot.delete_message, chat_id=uid, message_id=mid)
+            except BadRequest as exc:
+                if 'message to delete not found' not in str(exc).lower():
+                    remaining += 1
+                    logger.warning("Unpost uid=%s message=%s %s", uid, mid, _bc_error_text(exc))
+                    continue
+            except Exception as exc:
+                remaining += 1
+                logger.warning("Unpost uid=%s message=%s %s", uid, mid, _bc_error_text(exc))
+                continue
+            # Keep failed deletion rows so /unpost can be retried.
+            await asyncio.to_thread(_db_execute,
+                "DELETE FROM broadcast_logs WHERE batch_id = %s AND user_id = %s AND message_id = %s",
+                (last_batch, uid, mid))
+            deleted += 1
+            await asyncio.sleep(0.1)
+        await update.message.reply_text(
+            f"ဖျက်ပြီး/မရှိတော့သော message: {deleted}\nမဖျက်ရသေးသော message: {remaining}")
+    finally:
+        context.bot_data['unpost_busy'] = False
 
-    last_row = await asyncio.to_thread(_db_fetchone, "SELECT MAX(batch_id) FROM broadcast_logs")
-    last_batch = last_row[0] if last_row else None
-    if not last_batch:
-        return await update.message.reply_text("❌ ဖျက်စရာ Post မရှိပါဘူးရှင်။")
-
-    logs = await asyncio.to_thread(
-        _db_fetchall,
-        "SELECT user_id, message_id FROM broadcast_logs WHERE batch_id = %s",
-        (last_batch,),
-    )
-
-    deleted = 0
-    batch_size = 20
-    for i in range(0, len(logs), batch_size):
-        current_batch = logs[i:i + batch_size]
-        results = await asyncio.gather(
-            *[
-                context.bot.delete_message(chat_id=u_id, message_id=m_id)
-                for u_id, m_id in current_batch
-            ],
-            return_exceptions=True,
-        )
-        deleted += sum(1 for result in results if not isinstance(result, Exception))
-        await asyncio.sleep(1.0)
-
-    await asyncio.to_thread(
-        _db_execute,
-        "DELETE FROM broadcast_logs WHERE batch_id = %s",
-        (last_batch,),
-    )
-
-    await update.message.reply_text(f"✅ နောက်ဆုံးပို့ထားတဲ့ Post {deleted} ခုကို ပြန်ဖျက်လိုက်ပါပြီရှင်။")
-    
 
 async def send_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin မှ User တစ်ဦးတည်းကို Message တစ်ခုအား Reply ပြန်၍ ပို့ဆောင်ခြင်း"""
