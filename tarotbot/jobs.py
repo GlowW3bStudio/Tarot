@@ -235,6 +235,9 @@ async def nightly_report_job(context) -> None:
         memory = runtime.memory_mb()
         if memory:
             rows.append(("💾 RAM အသုံး", f"{memory:.0f} MB / 512 MB"))
+        issues = runtime.take_network_issues()
+        rows.append(("📶 Network ခဏထစ်မှု", " · ".join(f"{kind} {count}" for kind, count in issues.most_common())
+                     if issues else "မရှိပါ"))
         usage = await usage_rows(today, today)
         await reports.send_table(
             context.bot, config.ADMIN_ID, f"📊 ညစဉ် Report — {today:%d-%m-%Y}", rows,

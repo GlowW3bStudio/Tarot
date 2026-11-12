@@ -11,6 +11,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Iterable, List, Optional
 
+import httpx
 from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TimedOut
 
 from . import config
@@ -58,9 +59,24 @@ def looks_like_emoji_error(exc: Exception) -> bool:
     return isinstance(exc, BadRequest) and any(k in text for k in ("emoji", "icon"))
 
 
+_NOT_SENT = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
+
+
+def never_sent(exc: BaseException) -> bool:
+    """Request က Telegram ဆီ မရောက်ခဲ့တာ သေချာလား (ချိတ်ဆက်မှုကိုတောင် မဖွင့်နိုင်ခဲ့ / pool စောင့်ချိန်ကုန်)။
+    ဒီလိုဆိုရင်ပဲ ပြန်ပို့သည် — ရောက်ပြီးသား ဖြစ်နိုင်တဲ့ request ကို ပြန်ပို့ရင် စာနှစ်ခါ ရောက်နိုင်လို့ပါ။"""
+    seen, cause = set(), exc
+    while cause is not None and id(cause) not in seen:
+        seen.add(id(cause))
+        if isinstance(cause, _NOT_SENT):
+            return True
+        cause = cause.__cause__ or cause.__context__
+    return "pool timeout" in str(exc).lower()
+
+
 async def call(func: Callable[..., Awaitable], *args, limiter: Optional[RateLimiter] = LIMITER, **kwargs):
-    """Telegram API တစ်ခါခေါ်ခြင်း — rate limit + RetryAfter/ကွန်ရက် retry ပါသည်။"""
-    network_retries = 0
+    """Telegram API တစ်ခါခေါ်ခြင်း — rate limit + RetryAfter စောင့်ခြင်း + ချိတ်ဆက်မရရင် ၂ ခါထိ ပြန်ကြိုးစားခြင်း။"""
+    safe_retries = 0
     for _ in range(8):
         if limiter is not None:
             await limiter.wait()
@@ -73,17 +89,17 @@ async def call(func: Callable[..., Awaitable], *args, limiter: Optional[RateLimi
                 limiter.pause(seconds)
             else:
                 await asyncio.sleep(seconds)
-        except TimedOut:
-            raise  # ရောက်/မရောက် မသေချာလို့ ထပ်မပို့ပါ (နှစ်ခါရောက်မှာ စိုးလို့)
         except BadRequest as exc:
             if looks_like_emoji_error(exc):
                 raise PremiumEmojiError(str(exc)) from exc
             raise
-        except NetworkError:
-            network_retries += 1
-            if network_retries > 2:
-                raise
-            await asyncio.sleep(2 * network_retries)
+        except NetworkError as exc:  # TimedOut လည်း ဒီထဲမှာ ပါသည်
+            if never_sent(exc) and safe_retries < 2:
+                safe_retries += 1
+                logger.warning("Could not reach Telegram (%s); retry %d/2", type(exc).__name__, safe_retries)
+                await asyncio.sleep(1.5 * safe_retries)
+                continue
+            raise  # ရောက်/မရောက် မသေချာရင် ထပ်မပို့ပါ (နှစ်ခါရောက်မှာ စိုးလို့)
     raise RetryAfter(30)
 
 
@@ -93,10 +109,14 @@ def classify(exc: BaseException):
     if isinstance(exc, Forbidden):
         if "deactivated" in text:
             return INACTIVE, "Account ဖျက်ထားသူ"
+        if "to bots" in text:
+            return INACTIVE, "Bot / Telegram system account"
         return INACTIVE, "Bot ကို ပိတ်ထားသူ"
     if isinstance(exc, BadRequest):
         if "chat not found" in text or "user not found" in text or "peer_id_invalid" in text:
             return INACTIVE, "Chat မတွေ့တော့သူ"
+        if "bot_to_bot" in text:
+            return INACTIVE, "Bot / Telegram system account"
         return FAILED, f"Telegram က လက်မခံ ({str(exc)[:80]})"
     if isinstance(exc, PremiumEmojiError):
         return FAILED, "Premium emoji ကို Telegram က လက်မခံ"

@@ -20,7 +20,7 @@ from telegram.ext import (
     filters,
 )
 
-from . import buttons, catalog, config, content, db, delivery, runtime, texts
+from . import buttons, catalog, config, content, db, delivery, runtime, sender, texts
 from .delivery import Photo, card_photo
 from .richtext import Doc
 
@@ -74,6 +74,14 @@ async def edit(query, text: str, reply_markup=None):
         raise
 
 
+async def answer(query, text=None, show_alert: bool = False) -> None:
+    """ခလုတ်နှိပ်တာကို Telegram ဆီ အကြောင်းပြန်သည် — မအောင်မြင်လည်း ဆက်လုပ်သွားမည်။"""
+    try:
+        await sender.call(query.answer, text=text, show_alert=show_alert, limiter=None)
+    except Exception as exc:  # noqa: BLE001 — network ထစ်တာကြောင့် user လုပ်ဆောင်ချက် မရပ်စေရန်
+        logger.info("Callback answer failed (continuing): %s", exc)
+
+
 async def delete_quietly(message) -> None:
     if message is None:
         return
@@ -89,6 +97,8 @@ async def mark_user_active(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     user = update.effective_user
     if not user or user.id == config.ADMIN_ID or user.id in runtime.active_users:
         return
+    if user.is_bot or user.id in config.TELEGRAM_SERVICE_IDS:
+        return  # Bot / Telegram system account တွေကို user စာရင်းထဲ မထည့်ပါ
     try:
         await db.run(db.ensure_user_active, user.id)
         runtime.active_users.add(user.id)
@@ -109,7 +119,7 @@ async def is_banned(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     if not context.user_data["is_banned"]:
         return False
     if update.callback_query:
-        await update.callback_query.answer(texts.BANNED_ALERT, show_alert=True)
+        await answer(update.callback_query, texts.BANNED_ALERT, show_alert=True)
     elif update.effective_chat:
         await say(context, update.effective_chat.id, texts.BANNED)
     return True
@@ -121,6 +131,8 @@ async def has_credits(user_id: int) -> bool:
     try:
         row = await db.run(db.get_credits, user_id)
         if row is None:
+            if user_id in config.TELEGRAM_SERVICE_IDS:
+                return False
             await db.run(db.create_user, user_id)
             runtime.active_users.add(user_id)
             return True
@@ -221,7 +233,7 @@ async def share(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --- Cancel ----------------------------------------------------------------------------------
 async def cancel_tarot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await answer(query)
     await delete_quietly(query.message)
     await say(context, update.effective_chat.id, texts.CANCELLED, reply_markup=buttons.main_keyboard)
     return END
@@ -229,7 +241,7 @@ async def cancel_tarot(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cancel_love(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await answer(query)
     await edit(query, texts.LOVE_CANCELLED)
     return END
 
@@ -250,7 +262,7 @@ async def bday_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def bday_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await answer(query)
     if query.data == "delete_bday_data":
         await db.run(db.forget_birthday, update.effective_user.id)
         await edit(query, texts.BDAY_DELETED)
@@ -324,7 +336,7 @@ async def show_categories(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def category_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await answer(query)
     if runtime.too_fast(update.effective_user.id, 1):
         return None
     category = catalog.category_by_label(query.data)
@@ -335,7 +347,7 @@ async def category_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def sub_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await answer(query)
     if runtime.too_fast(update.effective_user.id, 1):
         return None
     context.user_data["sub"] = query.data
@@ -417,7 +429,7 @@ async def guide_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def guide_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await answer(query)
     if query.data == "guide_outcome":
         await edit(query, texts.GUIDE_ASK_OUTCOME, buttons.guide_outcome_keyboard)
         return SELECT_OUTCOME_SUB
@@ -428,7 +440,7 @@ async def guide_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def guide_outcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await answer(query)
     context.user_data["guide_sub_mode"] = query.data.replace("guide_sub_", "")
     await edit(query, texts.GUIDE_ASK_NUMBER_OUTCOME, buttons.cancel_keyboard)
     return GET_GUIDE_NUM
@@ -480,7 +492,7 @@ async def love_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def love_relation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await answer(query)
     context.user_data["relation_type"] = "near" if query.data == "rel_near" else "ldr"
     await edit(query, texts.LOVE_ASK_METHOD, buttons.love_method_keyboard)
     return CHOOSE_LOVE_METHOD
@@ -488,7 +500,7 @@ async def love_relation(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def love_method(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await answer(query)
     if query.data == "love_method_tarot":
         await edit(query, texts.LOVE_ASK_NUMBER, lambda: buttons.cancel_keyboard(buttons.CB_LOVE_CANCEL))
         return TAROT_LOVE_INPUT
@@ -498,7 +510,7 @@ async def love_method(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def love_first_sign(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await answer(query)
     context.user_data["first_zodiac"] = query.data.replace("zlove_", "", 1)
     await edit(query, texts.LOVE_ASK_SECOND_SIGN,
                lambda: buttons.zodiac_keyboard("zlove_", buttons.CB_LOVE_CANCEL, with_back=True))
@@ -507,7 +519,7 @@ async def love_first_sign(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def love_second_sign(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await answer(query)
     if query.data == "zlove_back_first":
         await edit(query, texts.LOVE_ASK_FIRST_SIGN, lambda: buttons.zodiac_keyboard("zlove_", buttons.CB_LOVE_CANCEL))
         return ZODIAC_FIRST
@@ -521,7 +533,7 @@ async def love_second_sign(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def love_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await answer(query)
     user_id, chat_id = update.effective_user.id, update.effective_chat.id
     if query.data == "zlove_back_first":
         await edit(query, texts.LOVE_ASK_FIRST_SIGN_AGAIN, lambda: buttons.zodiac_keyboard("zlove_", buttons.CB_LOVE_CANCEL))
@@ -660,7 +672,7 @@ async def personality_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def personality_sign(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await answer(query)
     sign = query.data.replace("pers_", "", 1)
     context.user_data["selected_pers_zodiac"] = sign
     await edit(query, texts.PERSONALITY_ASK_GENDER.format(sign=esc(sign)), buttons.gender_keyboard)
@@ -669,7 +681,7 @@ async def personality_sign(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def personality_gender(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await answer(query)
     user_id, chat_id = update.effective_user.id, update.effective_chat.id
     gender = "male" if query.data == "pers_gender_male" else "female"
     sign = context.user_data.get("selected_pers_zodiac", "")
@@ -702,7 +714,7 @@ async def personality_gender(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # --- Review / အကြံပြုစာ ---------------------------------------------------------------------------
 async def review_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await answer(query)
     await delete_quietly(query.message)
     chat_id = update.effective_chat.id
     if query.data == buttons.CB_REVIEW_YES:
@@ -848,9 +860,9 @@ async def _pick_card(update: Update, context: ContextTypes.DEFAULT_TYPE, kind: s
     if await is_banned(update, context):
         return
     if message is None or not _first_pick(context, message, kind):
-        await query.answer(texts.ALREADY_PICKED)
+        await answer(query, texts.ALREADY_PICKED)
         return
-    await query.answer()
+    await answer(query)
     user_id, chat_id = update.effective_user.id, update.effective_chat.id
     runtime.record_usage("daily_card" if kind == buttons.CB_DAILY else "weekly_card", user_id)
     await typing(context, chat_id)
@@ -879,10 +891,7 @@ async def weekly_card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 async def stale_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Bot ပြန်စတင်ပြီးနောက် ခလုတ်အဟောင်းကို နှိပ်ရင် spinner မလည်နေစေရန်။"""
-    try:
-        await update.callback_query.answer("ဒီခလုတ်က သက်တမ်းကုန်သွားပါပြီ။ Menu ကနေ ပြန်စပေးပါရှင်။ ✨")
-    except TelegramError:
-        pass
+    await answer(update.callback_query, "ဒီခလုတ်က သက်တမ်းကုန်သွားပါပြီ။ Menu ကနေ ပြန်စပေးပါရှင်။ ✨")
 
 
 # --- Handler စာရင်း ---------------------------------------------------------------------------

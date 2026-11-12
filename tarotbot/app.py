@@ -8,7 +8,7 @@ from threading import Thread
 
 from flask import Flask
 from telegram import Update
-from telegram.error import BadRequest, Forbidden
+from telegram.error import BadRequest, Conflict, Forbidden, NetworkError, RetryAfter, TimedOut
 from telegram.ext import Application, CallbackQueryHandler, TypeHandler
 from telegram.warnings import PTBUserWarning
 
@@ -65,6 +65,18 @@ _HARMLESS = ("query is too old", "message is not modified", "message to delete n
              "message to edit not found", "query id is invalid")
 
 
+def _network_kind(error) -> str:
+    if isinstance(error, Conflict):
+        return "Conflict"
+    if isinstance(error, RetryAfter):
+        return "Flood"
+    if isinstance(error, TimedOut):
+        return "Timeout"
+    if isinstance(error, NetworkError) and not isinstance(error, BadRequest):
+        return "Network"
+    return ""
+
+
 async def on_error(update: object, context) -> None:
     error = context.error
     if isinstance(error, sender.PremiumEmojiError) or sender.looks_like_emoji_error(error):
@@ -72,6 +84,12 @@ async def on_error(update: object, context) -> None:
         return
     if isinstance(error, Forbidden) or (isinstance(error, BadRequest) and any(h in str(error).lower() for h in _HARMLESS)):
         logger.info("Ignored Telegram error: %s", error)
+        return
+    kind = _network_kind(error)
+    if kind:
+        # ခဏထစ်တဲ့ network ပြဿနာ — admin ကို ချက်ချင်း မပို့ဘဲ ညစဉ် report မှာ စုပြမည်
+        runtime.count_network_issue(kind)
+        logger.warning("Network issue counted (%s): %s", kind, error)
         return
     logger.error("Unhandled error while processing an update", exc_info=error)
     kind = type(error).__name__
@@ -114,12 +132,20 @@ def build_application(request=None) -> Application:
     return application
 
 
+def remove_service_accounts() -> None:
+    """Telegram system account တွေ user စာရင်းထဲ ရောက်နေရင် စာပို့စာရင်းကနေ ဖယ်သည်။"""
+    ids = list(config.TELEGRAM_SERVICE_IDS)
+    db.mark_inactive(ids)
+    runtime.active_users.difference_update(ids)
+
+
 def prepare() -> None:
     """Data load + DB ချိတ်ဆက်ခြင်း (RAM နည်းသေးချိန်မှာ card DB ကို အရင်ဆောက်သည်)။"""
     content.init()
     try:
         db.init()
         runtime.active_users.update(db.init_schema())
+        remove_service_accounts()
     except Exception:
         logger.critical("❌ Database connection failed — check DATABASE_URL", exc_info=True)
         sys.exit(1)

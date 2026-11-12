@@ -97,6 +97,20 @@ async def flush_usage() -> None:
             _usage[(day, feature, uid)] += taps
 
 
+# --- Network ခဏထစ်မှု (admin ကို ချက်ချင်း မပို့ဘဲ ညစဉ် report မှာ စုပြရန်) ------------------------
+network_issues: Counter = Counter()
+
+
+def count_network_issue(kind: str) -> None:
+    network_issues[kind] += 1
+
+
+def take_network_issues() -> Counter:
+    taken = Counter(network_issues)
+    network_issues.clear()
+    return taken
+
+
 # --- အခြား -------------------------------------------------------------------------------------------
 active_users: Set[int] = set()
 busy: Dict[str, bool] = {"broadcast": False, "unpost": False, "morning": False, "actions": False}

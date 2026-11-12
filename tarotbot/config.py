@@ -34,6 +34,9 @@ ADMIN_ID = _int_env("ADMIN_ID", 7051052390)
 STAFF_ID = _int_env("STAFF_ID", 6663409535)
 # Rich message ကို "admin" mode မှာ စမ်းသပ်ခွင့်ရှိသူများ
 TESTER_IDS = frozenset({ADMIN_ID, STAFF_ID})
+# Telegram system account များ (လူမဟုတ်ပါ — user စာရင်းထဲ မထည့်ပါ)
+#   777000 = Telegram အသိပေး account၊ 136817688 = Channel Bot၊ 1087968824 = Group Anonymous Bot
+TELEGRAM_SERVICE_IDS = frozenset({777000, 136817688, 1087968824})
 PORT = _int_env("PORT", 10000)
 BOT_USERNAME = os.environ.get("BOT_USERNAME", "TarotBayDinBot")
 
