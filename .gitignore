@@ -1,0 +1,7 @@
+# Bot run နေစဉ် အလိုအလျောက် ဖန်တီးတဲ့ ဖိုင်များ (GitHub ထဲ မတင်ရန်)
+tarot_cards.db
+tarot_cards.db.*
+bot_errors.log*
+__pycache__/
+*.pyc
+.DS_Store
