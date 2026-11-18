@@ -480,7 +480,6 @@ async def guide_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ok = await delivery.deliver(
         context.bot, chat_id, doc, photos=[card_photo(card_id)],
         photo_caption=texts.GUIDE_CAPTION.format(name=esc(user.full_name), card=f"<b>{esc(card_name)}</b>"),
-        reply_markup=buttons.main_keyboard,
     )
     await delete_quietly(wait)
     if not ok:
@@ -883,7 +882,7 @@ async def _pick_card(update: Update, context: ContextTypes.DEFAULT_TYPE, kind: s
     else:
         doc, caption = weekly_doc(card_id), texts.WEEKLY_TITLE.format(card=f"<b>{esc(name)}</b>")
     ok = await delivery.deliver(context.bot, chat_id, doc, photos=[card_photo(card_id)],
-                                photo_caption=caption, reply_markup=buttons.main_keyboard)
+                                photo_caption=caption)
     if not ok:
         context.user_data.get("picked_cards", set()).discard((message.chat_id, message.message_id, kind))
         await say(context, chat_id, texts.DAILY_FAILED, reply_markup=buttons.main_keyboard)

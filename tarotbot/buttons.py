@@ -141,7 +141,7 @@ def main_keyboard() -> ReplyKeyboardMarkup:
         [kbtn("bday"), kbtn("help")],
         [kbtn("suggest"), kbtn("share")],
     ]
-    return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True)
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True, one_time_keyboard=True, is_persistent=False)
 
 
 def writing_keyboard() -> ReplyKeyboardMarkup:
