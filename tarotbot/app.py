@@ -122,6 +122,7 @@ def build_application(request=None) -> Application:
         builder = builder.connect_timeout(10).read_timeout(20).write_timeout(30).pool_timeout(10)
     application = builder.build()
     application.add_handler(TypeHandler(Update, handlers_user.mark_user_active), group=-1)
+    application.add_handler(handlers_admin.album_recorder(), group=-2)   # admin album များကို မှတ်ထားရန်
     application.add_handler(handlers_user.conversation())
     for handler in handlers_admin.handlers():
         application.add_handler(handler)

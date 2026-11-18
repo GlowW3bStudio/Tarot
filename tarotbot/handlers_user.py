@@ -36,6 +36,13 @@ LOVE_FUTURE_NUM = 30
 END = ConversationHandler.END
 
 CARD_IDS = [str(i) for i in range(1, 79)]
+
+
+def with_footer(doc: Doc) -> Doc:
+    """ဟောစာတမ်းအောက်ဆုံးမှာ သတိပေးစာ တစ်ကြောင်း (ကျပန်း) ထည့်သည်။"""
+    if texts.READING_FOOTERS:
+        doc.footer = random.choice(texts.READING_FOOTERS)
+    return doc
 TEXT_INPUT = filters.TEXT & ~filters.COMMAND
 
 
@@ -359,16 +366,18 @@ def three_card_doc(cards, category, sub, zodiac: str) -> Doc:
     data = content.get()
     doc = Doc().title(texts.THREE_CARD_TITLE.format(sub=sub.label))
     for index, card_id in enumerate(cards):
-        meaning = data.meaning(card_id, category.key, sub.key) or texts.CARD_NOT_READY
+        position = texts.THREE_CARD_POSITIONS[index]
+        meaning = data.meaning(card_id, category.key, sub.key, position) or texts.CARD_NOT_READY
         doc.heading(f"📅 {texts.THREE_CARD_TIMEFRAMES[index]}")
         doc.label(f"🃏 ကဒ် {index + 1}: {data.card_name(card_id)}")
         doc.para(f"📝 {meaning}")
         if index == 2 and category.key != "general":
+            # ရာသီအကြံပြုချက်က တတိယကဒ် (အနာဂတ်) ရဲ့ အုပ်စု (good / mixed / challenging) ပေါ်မူတည်သည်
             advice = data.zodiac_advice(card_id, zodiac, category.key, sub.key)
             if advice:
                 doc.heading(texts.THREE_CARD_ZODIAC.format(zodiac=zodiac))
                 doc.para(advice)
-    return doc
+    return with_footer(doc)
 
 
 async def three_card_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -461,13 +470,13 @@ async def guide_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
     entry = data.guide_entry(card_id)
     mode = context.user_data.get("guide_sub_mode", "advice")
     if mode == "advice":
-        title, result, note = texts.GUIDE_TITLE_ADVICE, entry.get("advice") or texts.GUIDE_NOT_READY, texts.GUIDE_NOTE_ADVICE
+        title, result = texts.GUIDE_TITLE_ADVICE, entry.get("advice") or texts.GUIDE_NOT_READY
     else:
         outcomes = entry.get("outcomes") if isinstance(entry.get("outcomes"), dict) else {}
-        title, result, note = texts.GUIDE_TITLE_OUTCOME, outcomes.get(mode) or texts.GUIDE_OUTCOME_NOT_READY, texts.GUIDE_NOTE_OUTCOME
+        title, result = texts.GUIDE_TITLE_OUTCOME, outcomes.get(mode) or texts.GUIDE_OUTCOME_NOT_READY
     card_name = data.card_name(card_id)
-    doc = (Doc().title(title).label(f"🃏 {card_name}").para(f"📝 {result}")
-           .para(texts.GUIDE_ENERGY.format(energy=entry.get("energy", "??"))).note(note))
+    doc = with_footer(Doc().title(title).label(f"🃏 {card_name}").para(f"📝 {result}")
+                      .para(texts.GUIDE_ENERGY.format(energy=entry.get("energy", "??"))))
     ok = await delivery.deliver(
         context.bot, chat_id, doc, photos=[card_photo(card_id)],
         photo_caption=texts.GUIDE_CAPTION.format(name=esc(user.full_name), card=f"<b>{esc(card_name)}</b>"),
@@ -557,6 +566,7 @@ async def love_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
            .heading(texts.LOVE_ZODIAC_WEAKNESS).para(result.get("weakness", ""))
            .heading(texts.LOVE_ZODIAC_ADVICE).para(result.get("advice", ""))
            .para(texts.LOVE_ZODIAC_CLOSING))
+    with_footer(doc)
     ok = await delivery.deliver(context.bot, chat_id, doc)
     await delete_quietly(query.message)
     if not ok:
@@ -591,8 +601,8 @@ async def love_tarot_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
     wait = await say(context, chat_id, texts.LOVE_TAROT_WAIT)
     card = random.choice(cards)
     relation_text = "LDR" if relation == "ldr" else "Near"
-    doc = (Doc().label(texts.LOVE_TAROT_CARD.format(card=card.get("name", "")))
-           .heading(texts.LOVE_TAROT_HEADING).para(card.get("love_meaning", "")))
+    doc = with_footer(Doc().label(texts.LOVE_TAROT_CARD.format(card=card.get("name", "")))
+                      .heading(texts.LOVE_TAROT_HEADING).para(card.get("love_meaning", "")))
     ok = await delivery.deliver(
         context.bot, chat_id, doc, photos=[_love_card_photo(card)],
         photo_caption=texts.LOVE_TAROT_CAPTION.format(name=esc(user.full_name), relation=relation_text),
@@ -628,7 +638,7 @@ def love_future_doc(card_id: str) -> Doc:
         value = entry.get(key)
         if isinstance(value, str) and value.strip():
             doc.heading(heading).para(value)
-    return doc
+    return with_footer(doc)
 
 
 async def love_future_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -828,7 +838,7 @@ async def _after_pick(context, message, used: str) -> None:
 def daily_doc(card_id: str) -> Doc:
     data = content.get()
     text = data.daily_text(card_id) or texts.DAILY_NOT_READY
-    return Doc().title(texts.DAILY_TITLE.format(card=data.card_name(card_id))).para(f"📝 {text}")
+    return with_footer(Doc().title(texts.DAILY_TITLE.format(card=data.card_name(card_id))).para(f"📝 {text}"))
 
 
 def weekly_doc(card_id: str) -> Doc:
@@ -848,10 +858,10 @@ def weekly_doc(card_id: str) -> Doc:
         elif isinstance(value, list):
             items = [v for v in value if isinstance(v, str) and v.strip()]
             if items:
-                doc.heading(heading).bullets(items)
+                doc.heading(heading).para("\n".join(items))   # bullet dot မပါဘဲ တစ်ကြောင်းစီ
         elif isinstance(value, str) and value.strip():
             doc.heading(heading).para(value)
-    return doc
+    return with_footer(doc)
 
 
 async def _pick_card(update: Update, context: ContextTypes.DEFAULT_TYPE, kind: str) -> None:

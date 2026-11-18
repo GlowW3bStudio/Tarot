@@ -37,6 +37,8 @@ class Doc:
     blocks: List[Block] = field(default_factory=list)
     # None = ~၁၀% ပြမည်။ ဂဏန်းဆိုရင် ခေါင်းစဉ် (heading) အဲ့ဒီအရေအတွက်အထိ ပြမည်။
     shown_sections: Optional[int] = None
+    # အောက်ဆုံးမှာ အမြဲပြမယ့် သတိပေးစာ ("ဆက်ဖတ်ရန်" အပြင်ဘက်)
+    footer: str = ""
 
     def add(self, kind: str, text: str = "", items: Sequence[str] = ()) -> "Doc":
         text = (text or "").strip()
@@ -180,6 +182,8 @@ def render_rich(doc: Doc, photo_file_ids: Sequence[str] = ()) -> dict:
     if hidden:
         inner = "".join(_rich_block(b) for b in hidden)
         parts.append(f"<details><summary>{esc(texts.READ_MORE)}</summary>{inner}</details>")
+    if doc.footer:
+        parts.append(f"<p><i>{esc(doc.footer)}</i></p>")
     payload = {"html": "".join(parts)}
     if media:
         payload["media"] = media
@@ -284,5 +288,12 @@ def render_plain(doc: Doc, limit: int = 3900) -> List[str]:
             quote_len += (sep if quote_len else 0) + size
         if quote:
             current.append("<blockquote expandable>" + "\n\n".join(quote) + "</blockquote>")
+            current_len += (sep if current_len else 0) + quote_len
+    if doc.footer:
+        footer = f"<i>{esc(doc.footer)}</i>"
+        size = visible_len(footer)
+        if current and current_len + sep + size > limit:
+            flush()
+        current.append(footer)
     flush()
     return messages

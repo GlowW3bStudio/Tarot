@@ -117,9 +117,16 @@ async def run_morning(bot, *, test_chat: Optional[int] = None, force_sunday: Opt
                                        on_progress=on_progress, progress_every=1000)
         await flush_actions()
         if test_chat is None:
-            await _save_morning_state({"date": today, "cursor": 0, "done": True})
-            title = "🌅 တနင်္ဂနွေ မနက်စာ (daily + weekly) ပို့ပြီးပါပြီ" if sunday else "🌅 မနက်စာ ပို့ပြီးပါပြီ"
-            await reports.send_mass_report(bot, title, result)
+            if result.stopped:
+                # ဆက်ပို့လို့ရအောင် "ပြီးပြီ" မမှတ်ပါ — bot ပြန်စတက်ရင် (မနက် ၁၀ နာရီမတိုင်ခင်) ကျန်တဲ့သူတွေကို ဆက်ပို့မည်
+                await reports.send_mass_report(
+                    bot, "⏸ မနက်စာ ရပ်လိုက်ပါတယ်", result,
+                    footer="ပြဿနာ ပြေလည်ပြီး bot ကို ပြန်စတက်ရင် (Render → Manual Deploy) "
+                           "မနက် ၁၀ နာရီမတိုင်ခင် ကျန်တဲ့သူတွေကို ဆက်ပို့ပါမယ်။")
+            else:
+                await _save_morning_state({"date": today, "cursor": 0, "done": True})
+                title = "🌅 တနင်္ဂနွေ မနက်စာ (daily + weekly) ပို့ပြီးပါပြီ" if sunday else "🌅 မနက်စာ ပို့ပြီးပါပြီ"
+                await reports.send_mass_report(bot, title, result)
     finally:
         if test_chat is None:
             runtime.unlock("morning")

@@ -7,7 +7,6 @@ Rich message ပို့မရရင် (သို့) ပိတ်ထားရ
 reply_markup ကို function (ဥပမာ buttons.main_keyboard) အဖြစ် ပေးရင် premium emoji ပိတ်လိုက်ရတဲ့အခါ
 ခလုတ်ကို ပုံမှန် emoji နဲ့ ပြန်ဆောက်ပြီး ထပ်ပို့နိုင်သည်။
 """
-import asyncio
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,7 +14,7 @@ from typing import List, Optional, Sequence
 
 from telegram import InputFile, InputMediaPhoto, LinkPreviewOptions, Message, ReplyParameters
 from telegram.constants import ParseMode
-from telegram.error import TelegramError, TimedOut
+from telegram.error import TelegramError
 
 from . import config, runtime, sender
 from .richtext import Doc, render_plain, render_rich
@@ -60,13 +59,15 @@ def photo_input(photo: Photo, attach: bool = False):
     return None
 
 
-async def _send_photos(bot, chat_id: int, photos: Sequence[Photo], caption: Optional[str]) -> Optional[int]:
-    """ပုံ(များ) ကို ပို့ပြီး ပထမပုံရဲ့ message_id ကို ပြန်ပေးသည်။ file_id ကို cache လုပ်သည်။"""
+async def _send_photos(bot, chat_id: int, photos: Sequence[Photo], caption: Optional[str]):
+    """ပုံ(များ) ကို ပို့သည်။ (အောင်မြင်လား, ပထမပုံရဲ့ message_id) ကို ပြန်ပေးပြီး file_id ကို cache လုပ်သည်။
+    ပုံဖိုင် လုံးဝမရှိရင် (True, None) — စာသက်သက် ပို့လို့ရသည်။
+    ပုံပို့တာ မအောင်မြင်ရင် (False, None) — စာကို မပို့ရပါ (ပုံအရင်၊ စာနောက်မှ)။"""
     attach = len(photos) > 1   # media group ဆိုရင် attach:// နဲ့ upload ရသည်
     usable = [(p, photo_input(p, attach)) for p in photos]
     usable = [(p, data) for p, data in usable if data is not None]
     if not usable:
-        return None
+        return True, None
     caption = (caption or "")[: config.CAPTION_LIMIT] or None
     try:
         if len(usable) == 1:
@@ -74,7 +75,7 @@ async def _send_photos(bot, chat_id: int, photos: Sequence[Photo], caption: Opti
             msg = await sender.call(bot.send_photo, chat_id=chat_id, photo=data, caption=caption,
                                     parse_mode=ParseMode.HTML, write_timeout=60, read_timeout=60, limiter=None)
             await runtime.remember_media(photo.key, msg.photo[-1].file_id)
-            return msg.message_id
+            return True, msg.message_id
         media = [InputMediaPhoto(data, caption=caption if i == 0 else None, parse_mode=ParseMode.HTML)
                  for i, (_, data) in enumerate(usable)]
         msgs = await sender.call(bot.send_media_group, chat_id=chat_id, media=media,
@@ -82,15 +83,10 @@ async def _send_photos(bot, chat_id: int, photos: Sequence[Photo], caption: Opti
         for (photo, _), msg in zip(usable, msgs):
             if msg.photo:
                 await runtime.remember_media(photo.key, msg.photo[-1].file_id)
-        return msgs[0].message_id if msgs else None
-    except TimedOut:
-        # ပုံ ရောက်/မရောက် မသေချာ — ပုံရောက်ဖို့ အချိန်ပေးပြီးမှ စာကို ဆက်ပို့မည်
-        logger.warning("Photo upload timed out for chat %s; waiting before text", chat_id)
-        await asyncio.sleep(5)
-        return None
-    except TelegramError as exc:
+        return (True, msgs[0].message_id) if msgs else (False, None)
+    except TelegramError as exc:  # TimedOut အပါအဝင် — ပုံ မသေချာရင် စာကို မပို့ပါ
         logger.warning("Photo send failed for chat %s: %s", chat_id, exc)
-        return None
+        return False, None
 
 
 async def send_plain_text(bot, chat_id: int, doc: Doc, reply_markup=None,
@@ -127,7 +123,9 @@ async def deliver(bot, chat_id: int, doc: Doc, *, photos: Sequence[Photo] = (),
         file_ids = [runtime.media_cache.get(p.key) for p in photos]
         if photos and not all(file_ids):
             # ပုံကို တစ်ခါမှ upload မလုပ်ရသေးရင် ပုံကို အရင်ပို့ (file_id ရလာမည်)
-            await _send_photos(bot, chat_id, photos, photo_caption)
+            sent, _ = await _send_photos(bot, chat_id, photos, photo_caption)
+            if not sent:
+                return False
             photos_done, file_ids = True, []
         try:
             try:
@@ -150,7 +148,9 @@ async def deliver(bot, chat_id: int, doc: Doc, *, photos: Sequence[Photo] = (),
     try:
         reply_to = None
         if photos and not photos_done:
-            reply_to = await _send_photos(bot, chat_id, photos, photo_caption)
+            sent, reply_to = await _send_photos(bot, chat_id, photos, photo_caption)
+            if not sent:
+                return False   # ပုံမရောက်ရင် စာမပို့ — credit မနှုတ်ဘဲ ပြန်ကြိုးစားခိုင်းမည်
         await send_plain_text(bot, chat_id, doc, reply_markup, reply_to)
         return True
     except Exception:

@@ -88,6 +88,8 @@ async def send_mass_report(bot, title: str, result: sender.MassResult, footer: s
     ]
     if result.total > result.attempted:
         rows.append(("⏸ မပို့ရသေးသူ", f"{result.total - result.attempted:,}"))
+    if result.stopped and result.stop_reason:
+        rows.append(("⏸ ရပ်ရတဲ့ အကြောင်းရင်း", result.stop_reason))
     rows.append(("⏱ ကြာချိန်", duration_text(result.seconds)))
     await send_table(bot, chat_id or config.ADMIN_ID, title, rows, footer=footer, reasons=result.reasons)
 

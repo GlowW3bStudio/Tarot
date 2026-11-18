@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Iterable, List, Optional
 
 import httpx
-from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TimedOut
+from telegram.error import BadRequest, Forbidden, InvalidToken, NetworkError, RetryAfter, TimedOut
 
 from . import config
 
@@ -29,17 +29,22 @@ class RateLimiter:
         self._lock = asyncio.Lock()
 
     async def wait(self) -> None:
-        async with self._lock:
-            now = time.monotonic()
-            slot = max(now, self._next, self._pause_until)
-            self._next = slot + self.interval
-        delay = slot - time.monotonic()
-        if delay > 0:
-            await asyncio.sleep(delay)
+        while True:
+            async with self._lock:
+                now = time.monotonic()
+                slot = max(now, self._next, self._pause_until)
+                self._next = slot + self.interval
+            delay = slot - time.monotonic()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            # စောင့်နေတုန်း "ခဏရပ်" ခိုင်းခဲ့ရင် ရပ်ချိန်ကုန်တဲ့အထိ ထပ်စောင့်ပြီးမှ ပို့မည်
+            if time.monotonic() >= self._pause_until:
+                return
 
     def pause(self, seconds: float) -> None:
         until = time.monotonic() + seconds
         self._pause_until = max(self._pause_until, until)
+        self._next = max(self._next, self._pause_until)
 
 
 LIMITER = RateLimiter(config.MASS_SEND_RATE)
@@ -118,6 +123,8 @@ def classify(exc: BaseException):
         if "bot_to_bot" in text:
             return INACTIVE, "Bot / Telegram system account"
         return FAILED, f"Telegram က လက်မခံ ({str(exc)[:80]})"
+    if isinstance(exc, InvalidToken):
+        return FAILED, "Bot token မမှန်တော့ပါ (token ပြောင်းထားလား စစ်ပါ)"
     if isinstance(exc, PremiumEmojiError):
         return FAILED, "Premium emoji ကို Telegram က လက်မခံ"
     if isinstance(exc, TimedOut):
@@ -139,10 +146,23 @@ class MassResult:
     started: float = field(default_factory=time.monotonic)
     finished: Optional[float] = None
     stopped: bool = False
+    stop_reason: str = ""
 
     @property
     def seconds(self) -> int:
         return int((self.finished or time.monotonic()) - self.started)
+
+
+# User တိုင်းကို ထိတဲ့ အမှား (ဒါတွေဖြစ်ရင် ဆက်ပို့လည်း အလကား) — ချက်ချင်း ရပ်မည်
+_FATAL_HINTS = ("message to copy not found", "message_id_invalid", "message to forward not found",
+                "wrong file identifier", "wrong remote file identifier")
+BREAKER_LIMIT = 30   # User တစ်ယောက်ချင်းရဲ့ အမှားမဟုတ်တဲ့ error ဆက်တိုက် ဒီလောက်ဖြစ်ရင် ရပ်မည်
+
+
+def is_fatal(exc: BaseException) -> bool:
+    if isinstance(exc, InvalidToken):
+        return True
+    return isinstance(exc, BadRequest) and any(h in str(exc).lower() for h in _FATAL_HINTS)
 
 
 async def run_mass(
@@ -154,14 +174,27 @@ async def run_mass(
     progress_every: int = config.PROGRESS_EVERY,
     workers: int = config.MASS_SEND_WORKERS,
     should_stop: Optional[Callable[[], bool]] = None,
+    breaker: Optional[int] = BREAKER_LIMIT,
 ) -> MassResult:
-    """recipients အားလုံးကို send_one(user_id) နဲ့ ပို့သည်။ user တစ်ယောက် မရလို့ တစ်ခုလုံး မရပ်ပါ။"""
+    """recipients အားလုံးကို send_one(user_id) နဲ့ ပို့သည်။
+
+    * User တစ်ယောက်ချင်းရဲ့ အမှား (block ထား၊ chat မတွေ့ စသည်) ကြောင့် မရပ်ပါ
+    * User အားလုံးကို ထိတဲ့ အမှား (token မမှန်၊ မူရင်းစာ ပျက်သွား) ဖြစ်ရင် ချက်ချင်း ရပ်သည်
+    * အခြားအမှား `breaker` ကြိမ် ဆက်တိုက် (ကြားထဲမှာ တစ်ယောက်မှ မရောက်) ဖြစ်ရင် ရပ်သည်
+    """
     queue: asyncio.Queue = asyncio.Queue()
     for uid in recipients:
         queue.put_nowait(uid)
     result = MassResult(total=queue.qsize())
     inactive_buffer: List[int] = []
     next_progress = progress_every
+    streak = 0
+
+    def halt(reason: str) -> None:
+        if not result.stopped:
+            result.stopped = True
+            result.stop_reason = reason
+            logger.error("Mass send stopped: %s", reason)
 
     async def flush_inactive() -> None:
         if inactive_buffer and on_inactive:
@@ -173,10 +206,11 @@ async def run_mass(
                 logger.exception("Could not mark %d users inactive", len(batch))
 
     async def worker() -> None:
-        nonlocal next_progress
+        nonlocal next_progress, streak
         while True:
             if should_stop and should_stop():
-                result.stopped = True
+                halt("ရပ်ခိုင်းထားလို့")
+            if result.stopped:
                 return
             try:
                 uid = queue.get_nowait()
@@ -185,6 +219,7 @@ async def run_mass(
             try:
                 await send_one(uid)
                 result.ok += 1
+                streak = 0
             except Exception as exc:  # noqa: BLE001 — user တစ်ယောက်ချင်းစီရဲ့ အမှား
                 outcome, reason = classify(exc)
                 result.reasons[reason] += 1
@@ -197,6 +232,11 @@ async def run_mass(
                     result.failed += 1
                 if outcome != INACTIVE:
                     logger.warning("Mass send uid=%s: %s", uid, reason)
+                    streak += 1
+                    if is_fatal(exc):
+                        halt(reason)
+                    elif breaker and streak >= breaker:
+                        halt(f"အမှား {streak} ကြိမ် ဆက်တိုက်ဖြစ်လို့ ({reason})")
             result.attempted += 1
             if len(inactive_buffer) >= 200:
                 await flush_inactive()

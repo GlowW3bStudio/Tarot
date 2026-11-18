@@ -183,3 +183,27 @@ def background(coro, name: str = "task"):
 
     task.add_done_callback(_done)
     return task
+
+
+# --- Admin ပို့လိုက်တဲ့ album (ပုံအများ) များ — /post နဲ့ /send က ပြန်သုံးသည် ---------------------------
+ALBUM_KEEP_SECONDS = 24 * 3600
+_albums: Dict[tuple, dict] = {}
+
+
+def remember_album(message) -> None:
+    """Album ထဲက message တစ်ခုချင်းကို မှတ်ထားသည် (Bot API က album တစ်ခုလုံးကို နောက်မှ ပြန်မပေးနိုင်လို့)။"""
+    if not message or not message.media_group_id:
+        return
+    now = time.monotonic()
+    for key in [k for k, v in _albums.items() if now - v["seen"] > ALBUM_KEEP_SECONDS]:
+        _albums.pop(key, None)
+    entry = _albums.setdefault((message.chat_id, message.media_group_id), {"messages": {}, "seen": now})
+    entry["messages"][message.message_id] = message
+    entry["seen"] = now
+
+
+def album_messages(chat_id: int, media_group_id: str) -> list:
+    entry = _albums.get((chat_id, media_group_id))
+    if not entry:
+        return []
+    return [entry["messages"][mid] for mid in sorted(entry["messages"])]

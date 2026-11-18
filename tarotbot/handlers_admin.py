@@ -203,6 +203,25 @@ async def banned_count(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 # --- တိုက်ရိုက်ပို့ / ကြေညာချက် -----------------------------------------------------------------------
+async def remember_album(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin ပို့တဲ့ album ထဲက ပုံတစ်ပုံချင်းကို မှတ်ထားသည် (/post, /send က album တစ်ခုလုံး ပို့နိုင်ဖို့)။"""
+    if _is_admin(update) and update.message and update.message.media_group_id:
+        runtime.remember_album(update.message)
+
+
+def album_recorder() -> MessageHandler:
+    return MessageHandler(filters.ChatType.PRIVATE & (filters.PHOTO | filters.VIDEO | filters.Document.ALL | filters.AUDIO),
+                          remember_album)
+
+
+def _album_plan(update: Update, target):
+    """Reply လုပ်ထားတာ album ဆိုရင် (plan, ပထမ message id)။ မမှတ်မိရင် ValueError။"""
+    messages = runtime.album_messages(update.effective_chat.id, target.media_group_id)
+    if not messages:
+        raise ValueError("❌ ဒီ album ကို bot က မမှတ်မိတော့ပါ (bot ပြန်စတက်ခဲ့ရင် ဖြစ်တတ်ပါတယ်)။ Album ကို bot ဆီ ပြန်ပို့ပြီးမှ Reply လုပ်ပါ။")
+    return broadcast.build_album_plan(messages), messages[0].message_id
+
+
 async def send_private(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_admin(update):
         return
@@ -212,8 +231,16 @@ async def send_private(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await reply(update, "❌ သုံးပုံ – ပို့ချင်တဲ့ စာ/ပုံကို Reply လုပ်ပြီး <code>/send USER_ID</code> လို့ ရိုက်ပါ။")
         return
     try:
-        await delivery.send_with_markup(context.bot.copy_message, chat_id=target, from_chat_id=update.effective_chat.id,
-                                        message_id=source.message_id, reply_markup=buttons.main_keyboard)
+        if source.media_group_id:
+            try:
+                plan, _ = _album_plan(update, source)
+            except ValueError as exc:
+                await reply(update, esc(str(exc)))
+                return
+            await broadcast.deliver_album(context.bot, target, update.effective_chat.id, plan)
+        else:
+            await delivery.send_with_markup(context.bot.copy_message, chat_id=target, from_chat_id=update.effective_chat.id,
+                                            message_id=source.message_id, reply_markup=buttons.main_keyboard)
         await reply(update, f"✅ ID <code>{target}</code> ဆီ ပို့ပြီးပါပြီ။")
     except Exception as exc:  # noqa: BLE001
         await reply(update, f"❌ ပို့လို့ မရပါ – {esc(sender.classify(exc)[1])}")
@@ -231,20 +258,28 @@ async def post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await reply(update, "❌ ပို့ချင်တဲ့ စာ/ပုံကို Reply လုပ်ပြီး <code>/post</code> လို့ ရိုက်ပါ။")
             runtime.unlock("broadcast")
             return
-        if target.media_group_id:
-            await reply(update, "❌ ပုံအများကြီး (album) ကို တစ်ခါတည်း မပို့နိုင်ပါ။ ပုံတစ်ပုံတည်း ပြန်ပို့ပြီး <code>/post</code> လုပ်ပါ။")
-            runtime.unlock("broadcast")
-            return
+        source_id = target.message_id
         try:
-            plan = broadcast.build_photo_plan(target)
+            if target.media_group_id:
+                plan, source_id = _album_plan(update, target)
+            else:
+                plan = broadcast.build_photo_plan(target)
         except ValueError as exc:
-            await reply(update, f"❌ {esc(str(exc))}")
+            message = str(exc)
+            await reply(update, esc(message) if message.startswith("❌") else f"❌ {esc(message)}")
             runtime.unlock("broadcast")
             return
         users = await db.run(db.recipients, 0)
-        mode = ("Caption ရှည်လို့ ပုံအရင်၊ စာနောက်မှ ခွဲပို့ပါမယ်။" if plan else "မူရင်းစာ/ပုံအတိုင်း ပို့ပါမယ်။")
+        if isinstance(plan, broadcast.AlbumPlan):
+            count = len(plan.message_ids)
+            mode = (f"Album ({count} ခု) ကို album ပုံစံအတိုင်း ပို့ပါမယ်။ Album မှာ menu ခလုတ် တွဲလို့ မရလို့ မပါပါ။ "
+                    "ပို့နှုန်းကလည်း ပုံမှန်ထက် နှေးပါမယ်။")
+            if plan.chunks:
+                mode += " Caption ရှည်လို့ ပုံတွေအရင်၊ စာကို အောက်ကနေ ခွဲပို့ပါမယ်။"
+        else:
+            mode = ("Caption ရှည်လို့ ပုံအရင်၊ စာနောက်မှ ခွဲပို့ပါမယ်။" if plan else "မူရင်းစာ/ပုံအတိုင်း ပို့ပါမယ်။")
         await reply(update, f"⏳ Admin ဆီ အရင်စမ်းပို့ပြီး user {len(users):,} ဦးဆီ စပို့ပါမယ်။\n{mode}")
-        runtime.background(broadcast.run_broadcast(context.bot, update.effective_chat.id, target.message_id, plan, users),
+        runtime.background(broadcast.run_broadcast(context.bot, update.effective_chat.id, source_id, plan, users),
                            name="broadcast")
     except Exception:
         runtime.unlock("broadcast")

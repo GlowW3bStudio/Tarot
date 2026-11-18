@@ -1,7 +1,9 @@
 """ဟောစာတမ်း data များ။
 
-* tarot_data.json (55MB) → SQLite (tarot_cards.db) ကနေ လိုတဲ့စာကိုပဲ ဖတ်သည် (RAM ~300MB သက်သာ)
-* ကျန်တဲ့ JSON ဖိုင်တွေ (စုစုပေါင်း ~8MB) ကို memory ထဲ load လုပ်ထားသည်
+* tarot_data.json(.gz) — ကဒ် ၃ ကဒ် ဟောစာတမ်း (ကဒ် × ကဏ္ဍခွဲ × အတိတ်/ပစ္စုပ္ပန်/အနာဂတ်) → SQLite ကနေ ဖတ်သည်
+* zodiac_advice.json — ရာသီ × ကဏ္ဍခွဲ × တတိယကဒ်ရဲ့ အုပ်စု (good / mixed / challenging)
+* card_tones.json — ကဒ်တစ်ကဒ်ချင်းရဲ့ အုပ်စု
+* ကျန်တဲ့ JSON ဖိုင်တွေကို memory ထဲ load လုပ်ထားသည်
 """
 import gzip
 import json
@@ -127,27 +129,30 @@ class Content:
                             "ldr": _load_json("zodiac_love_ldr.json", {})}
         self.weekly = _load_json("weekly_tarot.json", {})
         self.love_future = _load_json("love_future.json", {})
-        logger.info("Content loaded: daily=%d guide=%d weekly=%d love_future=%d cards=%d",
+        self.zodiac_advice_data = _load_json("zodiac_advice.json", {})
+        self.card_tones = _load_json("card_tones.json", {})
+        logger.info("Content loaded: daily=%d guide=%d weekly=%d love_future=%d advice_signs=%d tones=%d cards=%d",
                     len(self.daily), len(self.guide), len(self.weekly), len(self.love_future),
-                    len(self.cards.names))
+                    len(self.zodiac_advice_data), len(self.card_tones), len(self.cards.names))
 
     # --- Tarot ကဒ်ကြီး data ---
     def card_name(self, card_id: str) -> str:
         return self.cards.names.get(str(card_id)) or f"Card {card_id}"
 
-    def meaning(self, card_id: str, category_key: str, sub_key: str) -> Optional[str]:
-        if category_key == "general":
-            return self.cards.get(card_id, "general")
-        return self.cards.get(card_id, f"{category_key}/{sub_key}")
+    def meaning(self, card_id: str, category_key: str, sub_key: str, position: str = "present") -> Optional[str]:
+        """position = past / present / future (ကဒ်ကျတဲ့ နေရာအလိုက် စာ)။"""
+        base = "general" if category_key == "general" else f"{category_key}/{sub_key}"
+        return self.cards.get(card_id, f"{base}/{position}") or self.cards.get(card_id, base)
+
+    def card_tone(self, card_id: str) -> str:
+        tone = self.card_tones.get(str(card_id))
+        return tone if tone in ("good", "mixed", "challenging") else "mixed"
 
     def zodiac_advice(self, card_id: str, sign: str, category_key: str, sub_key: str) -> str:
-        # မူလ logic အတိုင်း: ရာသီတစ်ခုလုံးအတွက် စာ → ကဏ္ဍအတွက် စာ → ကဏ္ဍခွဲအတွက် စာ
-        for path in (f"zodiac_rules/{sign}", f"zodiac_rules/{sign}/{category_key}",
-                     f"zodiac_rules/{sign}/{category_key}/{sub_key}"):
-            value = self.cards.get(card_id, path)
-            if value:
-                return value
-        return ""
+        """တတိယကဒ်ရဲ့ အုပ်စုနဲ့ ကိုက်တဲ့ ရာသီအကြံပြုချက်။"""
+        node = self.zodiac_advice_data.get(sign, {}).get(category_key, {}).get(sub_key, {})
+        value = node.get(self.card_tone(card_id)) if isinstance(node, dict) else None
+        return value if isinstance(value, str) else ""
 
     # --- အခြား data ---
     def daily_text(self, card_id: str) -> Optional[str]:
